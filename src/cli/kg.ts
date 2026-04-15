@@ -13,6 +13,7 @@ import { createAnthropicClient, DEFAULT_ANSWER_MODEL } from "../answer/client.ts
 import {
   createExtractorClient,
   extractDecisionsFromDoc,
+  classifyExtractedDecisions,
   materializeDecisions,
   DEFAULT_EXTRACTOR_MODEL,
 } from "../extractor/index.ts";
@@ -35,7 +36,9 @@ Commands:
                               falls back to $ORGMEM_VAULT if --vault omitted
   kg extract-decisions <file>  Run Lane C Decision Extractor on a file inside the vault.
                               Creates Decision nodes + decided_in edges.
-                              flags: --vault <path>, --dry-run, --json, --model <id>
+                              Classify-postfilter ON by default (drops non_decision items).
+                              flags: --vault <path>, --dry-run, --json, --model <id>,
+                                     --no-classify-filter
   kg status                 Print node/edge counts + vec status + embedding queue
   kg doctor [--vault <path>] Diagnose sqlite-vec + API keys + vault + schema + embed queue
   kg --version
@@ -292,11 +295,23 @@ async function main(): Promise<void> {
       const client = createExtractorClient({ apiKey, model: args.model });
 
       let extracted;
+      const verbatimDropped: Array<{ text: string; reason: string }> = [];
       try {
-        extracted = await extractDecisionsFromDoc(client, title, body);
+        extracted = await extractDecisionsFromDoc(client, title, body, {
+          onDropped: (d) => verbatimDropped.push(d),
+        });
       } catch (err) {
         process.stderr.write(`extractor error: ${(err as Error).message}\n`);
         process.exit(3);
+      }
+
+      const extractedBeforeClassify = extracted.length;
+      const classifyDropped: Array<{ text: string; reason: string; classifyReasoning?: string }> =
+        [];
+      if (args.classifyFilter !== false) {
+        extracted = await classifyExtractedDecisions(client, extracted, {
+          onDropped: (d) => classifyDropped.push(d),
+        });
       }
 
       if (args.dryRun) {
@@ -304,13 +319,18 @@ async function main(): Promise<void> {
           sourceDocId: row.id,
           sourceFile: relPath,
           dryRun: true,
+          extractedBeforeClassify,
           extracted,
+          verbatimDropped,
+          classifyDropped,
         };
         if (args.json) {
           process.stdout.write(JSON.stringify(out, null, 2) + "\n");
         } else {
           process.stdout.write(
-            `extracted ${extracted.length} candidate decision(s) from '${relPath}' (dry-run, nothing written).\n`,
+            `extracted ${extracted.length} candidate decision(s) from '${relPath}' (dry-run, nothing written; ` +
+              `LLM returned ${extractedBeforeClassify + verbatimDropped.length}, ` +
+              `${verbatimDropped.length} paraphrase-dropped, ${classifyDropped.length} classify-dropped).\n`,
           );
           for (const e of extracted) {
             const lineRef = e.line !== null ? ` (line ${e.line})` : "";
@@ -325,7 +345,10 @@ async function main(): Promise<void> {
         sourceDocId: row.id,
         sourceFile: relPath,
         model: args.model ?? DEFAULT_EXTRACTOR_MODEL,
+        extractedBeforeClassify,
         extractedCount: extracted.length,
+        verbatimDroppedCount: verbatimDropped.length,
+        classifyDroppedCount: classifyDropped.length,
         created: report.created,
         skipped: report.skipped,
         errors: report.errors,
@@ -335,7 +358,10 @@ async function main(): Promise<void> {
         process.stdout.write(JSON.stringify(payload, null, 2) + "\n");
       } else {
         process.stdout.write(
-          `extracted ${extracted.length}, created ${report.created.length}, skipped ${report.skipped.length} (idempotent), errors ${report.errors.length} from '${relPath}' (${report.wallMs}ms)\n`,
+          `extracted ${extracted.length} (LLM ${extractedBeforeClassify + verbatimDropped.length}, ` +
+            `verbatim-dropped ${verbatimDropped.length}, classify-dropped ${classifyDropped.length}), ` +
+            `created ${report.created.length}, skipped ${report.skipped.length} (idempotent), ` +
+            `errors ${report.errors.length} from '${relPath}' (${report.wallMs}ms)\n`,
         );
         for (const c of report.created) {
           process.stdout.write(`  +  ${c.mdPath}  (${c.id})\n`);
@@ -462,10 +488,11 @@ interface ExtractArgs {
   model?: string;
   dryRun?: boolean;
   json?: boolean;
+  classifyFilter?: boolean; // default: true (classify-postfilter ON)
 }
 
 function parseExtractArgs(rest: string[]): ExtractArgs {
-  const out: ExtractArgs = {};
+  const out: ExtractArgs = { classifyFilter: true };
   const positional: string[] = [];
   for (let i = 0; i < rest.length; i++) {
     const a = rest[i];
@@ -475,6 +502,10 @@ function parseExtractArgs(rest: string[]): ExtractArgs {
     }
     if (a === "--json") {
       out.json = true;
+      continue;
+    }
+    if (a === "--no-classify-filter") {
+      out.classifyFilter = false;
       continue;
     }
     if (a === "--vault") {

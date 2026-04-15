@@ -31,3 +31,8 @@ export {
   type MaterializeOptions,
   type MaterializeReport,
 } from "./materialize.ts";
+export {
+  classifyExtractedDecisions,
+  type PostFilterDropped,
+  type PostFilterOptions,
+} from "./postfilter.ts";

@@ -10,6 +10,7 @@ import {
   createStubExtractorClient,
   extractDecisionsFromDoc,
   classifyDecision,
+  classifyExtractedDecisions,
   materializeDecisions,
   parseExtractorJson,
   type ExtractedDecision,
@@ -180,6 +181,60 @@ describe("extractDecisionsFromDoc", () => {
 
     const out = await extractDecisionsFromDoc(client, "demo", body);
     expect(out.length).toBe(2);
+  });
+
+  test("classifyExtractedDecisions drops non_decision items (dogfood-1 fix)", async () => {
+    // Simulates Lane C dogfood (2026-04-15) issue (1): the EXTRACT path's
+    // cap=15 surfaces goals/metrics/candidate-lists at ~40% FP rate. The
+    // CLASSIFY postfilter reuses the locked v2 prompt (P=1.000, R=0.971)
+    // to reject them before materialize.
+    const client = createStubExtractorClient([
+      { match: "Approach C: CHOSEN", text: '{"label":"decision","reasoning":"CHOSEN"}' },
+      { match: "Target: p95 latency", text: '{"label":"non_decision","reasoning":"metric target"}' },
+      { match: "Candidates: DuckDB", text: '{"label":"non_decision","reasoning":"option list"}' },
+      { match: "DEFERRED to v1.1", text: '{"label":"decision","reasoning":"explicit deferral"}' },
+    ]);
+
+    const input: ExtractedDecision[] = [
+      { text: "Approach C: CHOSEN", reasoning: "r", line: 1 },
+      { text: "Target: p95 latency under 200ms at 10k QPS.", reasoning: "r", line: 2 },
+      { text: "Candidates: DuckDB, SQLite, LibSQL.", reasoning: "r", line: 3 },
+      { text: "Agent Audit Trail DEFERRED to v1.1.", reasoning: "r", line: 4 },
+    ];
+
+    const dropped: Array<{ text: string; reason: string }> = [];
+    const kept = await classifyExtractedDecisions(client, input, {
+      onDropped: (d) => dropped.push(d),
+    });
+
+    expect(kept.length).toBe(2);
+    expect(kept[0]!.text).toBe("Approach C: CHOSEN");
+    expect(kept[1]!.text).toBe("Agent Audit Trail DEFERRED to v1.1.");
+    expect(dropped.length).toBe(2);
+    expect(dropped.every((d) => d.reason === "classified_non_decision")).toBe(true);
+  });
+
+  test("classifyExtractedDecisions keeps items on classify error (fail-safe)", async () => {
+    // Network/LLM flakiness shouldn't silently delete potentially-real
+    // decisions. Policy: keep the item, surface the error via onDropped.
+    const client = createStubExtractorClient([
+      { match: "Approach C", text: '{"label":"decision","reasoning":"r"}' },
+      { match: "broken item", text: "not json at all" },
+    ]);
+
+    const input: ExtractedDecision[] = [
+      { text: "Approach C wins.", reasoning: "r", line: 1 },
+      { text: "broken item", reasoning: "r", line: 2 },
+    ];
+
+    const dropped: Array<{ text: string; reason: string }> = [];
+    const kept = await classifyExtractedDecisions(client, input, {
+      onDropped: (d) => dropped.push(d),
+    });
+
+    expect(kept.length).toBe(2); // both kept
+    expect(dropped.length).toBe(1);
+    expect(dropped[0]!.reason).toBe("classify_error");
   });
 
   test("verbatimCheck=false disables the post-check (testing-only escape hatch)", async () => {
