@@ -68,38 +68,49 @@ Exit codes:
   3  extraction failed (LLM error, malformed output, etc.)
 ```
 
-### 3.4 Graph materialization semantics
+### 3.4 Graph materialization semantics (LOCKED)
+
+Edge model: **one `decided_in` edge per Decision, stored in the Decision
+node's frontmatter** ("this decision is documented in <SourceDoc>"). No
+reverse `decides` edge on the source doc.
 
 For each extracted decision `e` with `e.text`, `e.reasoning`, `e.line`:
 
-1. `createNode({ type: 'Decision', title: <first 80 chars of e.text, title-cased>, content: e.text + '\n\n> ' + e.reasoning, date: <source doc mtime date> })` → returns `decisionId`.
-2. `createEdge({ srcId: sourceDocId, relation: 'decides', dstId: decisionId, sourceLine: 0 })` — source doc "decides" this decision. `sourceLine=0` puts it in the source doc's frontmatter edges.
-3. `createEdge({ srcId: decisionId, relation: 'decided_in', dstId: sourceDocId, sourceLine: 0 })` — Decision points back at its origin doc.
+1. `createNode({ type: 'Decision', title: <first 80 chars of e.text>, content: e.text + '\n\n> ' + e.reasoning, edges: [{ to: sourceDocId, relation: 'decided_in' }], date: <source doc mtime date>, metadata: { source_line: e.line } })` → returns `decisionId`.
+   - The `edges: [...]` param goes into the new Decision's frontmatter (sourceLine=0), and `upsertDocNodeAndEdges` (called inside `createNode`) materializes the row in `edges` table in the same transaction.
+   - No separate `createEdge` call is needed — the frontmatter edge is sufficient and is the canonical storage location for agent-authored edges per write.ts contract.
+2. The line-number field from the extractor is recorded in the Decision
+   node's frontmatter as `source_line: <n>` (via `metadata`) so a future
+   MCP tool can jump to the exact paragraph. It is NOT used as `sourceLine`
+   on the edge, because week-2 `createEdge` rejects non-zero `sourceLine`
+   (write.ts:308-312) — promote to an edge `source_line` later when
+   body-anchored edges ship.
 
-**Open question for Lane A review:** is the `decides` relation direction
-correct (Doc → Decision)? Alternate reading: the Decision itself "decides X"
-where X is the subject matter, not the doc. If the canonical direction
-conflicts, flip to `references` (Doc → Decision) + `decided_in`
-(Decision → Doc) and drop `decides`. **Blocker for execution — confirm
-before writing materialize.ts.**
-
-The line-number field from the extractor is recorded in the Decision node's
-frontmatter as `source_line: <n>` so a future MCP tool can jump to the exact
-paragraph. It is NOT used as `sourceLine` on the edge, because week-2
-`createEdge` rejects non-zero `sourceLine` (write.ts:308-312) — promote this
-to an edge source_line in a later week when body-anchored edges ship.
+File layout: Decision files land under `decisions/<YYYY-MM-DD>-<slug>.md` per
+the existing `TYPE_DIR` mapping in `write.ts:13-19`. No new directory scheme.
+"ADR" is an internal terminology note only — on disk it's just `decisions/`.
 
 ## 4. Port specifics
 
-### 4.1 Anthropic client — adopt orgmem's fetch-based pattern
+### 4.1 Anthropic client — separate `ExtractorClient` (do NOT reuse AnswerClient)
 
 probe uses `@anthropic-ai/sdk`; orgmem deliberately avoids it (`src/answer/client.ts`
 header: "the SDK's transitive deps are heavier than we need"). Port plan:
 
-- Reuse the existing `AnswerClient` interface shape (`{ system, user, maxTokens } → { text, usage }`).
-- classify/extract get a thin helper that wraps `client.complete()` + JSON
-  parsing with the same fence-stripping logic from probe's `parseJson`.
-- **No @anthropic-ai/sdk added to orgmem deps.**
+- Introduce a dedicated `ExtractorClient` in `src/extractor/client.ts`,
+  parallel in shape to `AnswerClient` but with its own contract:
+  - `complete({ system, user, temperature, maxTokens }) → { text, usage }`
+  - `temperature` defaults to **0** (classify requires this for reproducibility;
+    extract also sets 0 for the port).
+  - Own fence-stripping JSON parser + self-contained 1-shot retry on JSON
+    parse failure (mirrors probe's `parseJson` + `retry` in `decisions.ts`).
+- **Why not reuse `AnswerClient.complete()`**: the answer path's system
+  prompt is tuned for the `[[node-id]]` citation contract; its defaults and
+  shape leak that context. Keeping extractor isolated prevents eval-harness
+  regressions when the answer prompt evolves, and keeps the extractor
+  swappable (e.g. switch to a local model later) without touching ask code.
+- **No `@anthropic-ai/sdk` added to orgmem deps.** `ExtractorClient` uses
+  `fetch` and the same POST shape as `AnswerClient`'s real impl.
 
 ### 4.2 Prompt transfer — byte-for-byte
 
@@ -165,14 +176,22 @@ change and should ship alongside the orgmem port.
 
 ## 6. Step-by-step execution (week 3)
 
-Block on: Lane A engine lock confirmed + relation direction decision (§3.4 Open question).
+Block on: Lane A engine lock confirmed. (All §9 open questions now answered —
+see decisions folded into §3.4 / §4.1 / §6.4.)
 
-1. **Decide relation direction** (talk to Lane A). Write a one-line ADR in
-   `orgmem/docs/adr/` (if that dir exists; else inline in INTEGRATION-PLAN).
-2. **Port prompts + client helper.** `src/extractor/prompts.ts` + `src/extractor/client.ts` (fetch wrapper).
-3. **Port classify.ts + extract.ts.** Mirror probe's function shapes 1:1 against the orgmem AnswerClient.
-4. **Write materialize.ts.** Use `createNode` + `createEdge` per §3.4. Uses a single DB transaction via the engine's existing pattern.
-5. **Wire `kg extract-decisions`.** Follow the dispatch pattern at `kg.ts:62-83` (`kg import`) for shape: parse args, open DB, run, print JSON or summary, close.
+1. **Port prompts + client.** `src/extractor/prompts.ts` (byte-for-byte copy)
+   + `src/extractor/client.ts` (`ExtractorClient` per §4.1 — fetch, temp=0,
+   JSON parse w/ 1-shot retry).
+2. **Port classify.ts + extract.ts.** Mirror probe's function shapes 1:1
+   against `ExtractorClient`.
+3. **Write materialize.ts** per §3.4 edge model (single `decided_in` edge in
+   Decision frontmatter). Own the transaction: follow `src/vault/import.ts`'s
+   pattern — `materializeDecisions(handle, vault, sourceDocId, extracted[])`
+   opens `BEGIN IMMEDIATE`, calls `createNode` per decision, `COMMIT` on
+   success, `ROLLBACK` on any error. CLI only passes the DbHandle.
+4. **Wire `kg extract-decisions`.** Follow the dispatch pattern at
+   `kg.ts:62-83` (`kg import`): parse args, `runMigrations()`, `openDb`,
+   call extractor + materializer, print JSON or summary, `handle.raw.close()`.
 6. **Add tests.** `tests/extractor.test.ts` with:
    - fixture file under `tests/fixtures/` (a small markdown doc with 2 decisions + 2 non-decisions)
    - stub AnswerClient that returns canned responses → assert node/edge creation, frontmatter edges, idempotency on re-run.
@@ -186,11 +205,11 @@ Block on: Lane A engine lock confirmed + relation direction decision (§3.4 Open
 | Risk | Likelihood | Mitigation |
 |---|---|---|
 | Ported prompt behaves differently due to encoding/whitespace drift | Low | §5 regression check catches it pre-merge |
-| orgmem fetch-client's `complete()` shape insufficient for extractor (e.g. no temperature knob) | Med | Extend `AnswerRequest` to carry optional `temperature`; default to current behavior to avoid ask-path regression |
-| `createEdge` rejects non-zero sourceLine (write.ts:308) → can't anchor Decision edges to paragraphs | Known | Park source_line on the Decision node's frontmatter for now; upgrade when body-anchored edges ship |
+| `createEdge`/`createNode` rejects non-zero sourceLine → can't anchor Decision edges to paragraphs | Known | Park `source_line` on Decision frontmatter (as `metadata.source_line`) for now; upgrade when body-anchored edges ship |
 | Decision title collisions if many decisions share similar first 80 chars | Med | `pickId` already handles this (write.ts:112) — appends `-2`, `-3`. Accept the slight ugliness in week 3 |
 | Extract LLM response > `max_tokens=2000` on long docs | Low | Raise to 3000 for extract path; classify stays at 200. Add a test with a 10KB fixture |
-| Relation direction chosen wrong, need to flip later | Med | Keep materialize.ts small and test-covered so a later flip is a one-line change + migration |
+| Partial failure mid-batch leaves orphan Decision nodes | Low | `materializeDecisions` wraps the whole set in one BEGIN IMMEDIATE / COMMIT (per §6.3). ROLLBACK on any error = all-or-nothing per doc. |
+| `ExtractorClient` diverges from `AnswerClient` and we end up with two HTTP wrappers to maintain | Med | Accept the duplication — it's ~50 lines and the isolation is the point. Revisit only if a third caller appears. |
 
 ## 8. Post-integration follow-ups (not in scope for the port)
 
@@ -200,9 +219,18 @@ Block on: Lane A engine lock confirmed + relation direction decision (§3.4 Open
 - Body-anchored Decision edges once `createEdge` supports non-zero sourceLine.
 - RESOLUTION-BACKLOG d018 fix via dataset v1.1 bump (Lane C task 2).
 
-## 9. Open questions for Lane A
+## 9. Open questions — RESOLVED (2026-04-15)
 
-1. **Relation direction** (§3.4) — `decides` Doc→Decision vs Decision→Doc? Blocks execution.
-2. Is there a canonical spot for ADRs in orgmem? (`docs/adr/` doesn't exist yet.)
-3. Should `materializeDecisions` own the entire transaction, or should the CLI hand a DB handle that's already inside a transaction? Pattern in `import.ts` might already answer this.
-4. Is `AnswerClient.complete()` stable enough to reuse across modules, or should extractor get its own `ExtractorClient` to avoid coupling answer-path refactors to extract-path tests?
+All blocking decisions are locked. Kept here for the execution record:
+
+1. **Relation direction**: **Decision →(`decided_in`)→ SourceDoc**, edge stored
+   in the Decision's frontmatter. Single edge; no reverse `decides`. (§3.4)
+2. **ADR path**: reuse `decisions/<date>-<slug>.md` from the existing
+   `TYPE_DIR` mapping. No new `docs/adr/` directory. "ADR" stays as internal
+   terminology only. (§3.4)
+3. **Transaction ownership**: `materializeDecisions` owns the transaction
+   (BEGIN IMMEDIATE / COMMIT / ROLLBACK) following the `src/vault/import.ts`
+   pattern. CLI just passes the DbHandle. (§6.3)
+4. **Client separation**: ship a dedicated `ExtractorClient`; do NOT reuse
+   `AnswerClient`. Decouples eval harness from answer-path prompt evolution
+   and keeps the extractor swappable. (§4.1)
