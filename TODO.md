@@ -37,3 +37,8 @@ commit SHA when shipped.
 - [ ] Embedding dim switcher: if the chosen model's dim changes, drop and
   recreate `node_vec`. Gate on an explicit `kg reindex --reembed` flag
   so accidental runs don't wipe the vec store.
+- [ ] **Lane C dogfood follow-ups** (`docs/dogfood-2026-04-15.md`): 4 fixes
+  ordered by ROI — classify-as-postfilter (~40% FP at cap=15 → decision-only
+  graph), filename byte cap for long Korean titles, VERBATIM substring
+  post-check to drop paraphrased/hallucinated line refs, text-similarity
+  dedup for idempotent re-runs at temperature=0.
