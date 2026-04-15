@@ -28,7 +28,7 @@ class Orgmem < Formula
   desc "Agent-native knowledge & work graph (MCP) — markdown vault → SQLite + sqlite-vec"
   homepage "https://github.com/Nohyunjin/orgmem"
   license "MIT"
-  version "0.1.0" # BUMP on every release
+  version "0.1.1" # BUMP on every release
 
   # sqlite-vec loads libsqlite3 at runtime via Database.setCustomSQLite().
   # Apple's bundled libsqlite3 does not support loadable extensions, so
@@ -39,7 +39,7 @@ class Orgmem < Formula
   on_macos do
     on_arm do
       url "https://github.com/Nohyunjin/orgmem/releases/download/v#{version}/kg-darwin-arm64"
-      sha256 "84055b85b8ecebe1138188e7f05fc9805edfef3966841e9cfa977dc48d74e700"
+      sha256 "a7a6c966d3e64990bec8537c6f5521c18cf1f6b728fb3754811223f901a17cbd"
     end
     # Intel macOS is not currently produced by release.yml. Add an
     # `on_intel do ... end` block here once the matrix adds darwin-x64.
