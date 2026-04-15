@@ -192,4 +192,85 @@ describe("mcp e2e (real stdio child process)", () => {
     });
     expect(edgeRes.alreadyPresent).toBe(true);
   });
+
+  test("10. doc_append writes a new block to the Decision body + reindexes", async () => {
+    const APPEND_BLOCK = "## Follow-ups\n- Wire `task_update_status` from agent loop";
+    const res = await callTool(ctx.client, "doc_append", {
+      nodeId: EXPECTED_ID,
+      content: APPEND_BLOCK,
+    });
+    expect(res.id).toBe(EXPECTED_ID);
+    expect(res.sourceFile).toBe(EXPECTED_MD_PATH);
+    expect(res.appendedChars).toBe(APPEND_BLOCK.length);
+
+    const raw = readFileSync(join(ctx.vault, EXPECTED_MD_PATH), "utf8");
+    expect(raw).toContain("MCP e2e validation"); // original body preserved
+    expect(raw).toContain("## Follow-ups");
+    expect(raw).toContain("Wire `task_update_status` from agent loop");
+    // edges from test 8 must still be present (frontmatter not clobbered)
+    expect(raw).toContain("edges:");
+    expect(raw).toContain("relation: drives");
+  });
+
+  test("11. doc_append rejects empty content + nonexistent node", async () => {
+    const empty = (await ctx.client.callTool({
+      name: "doc_append",
+      arguments: { nodeId: EXPECTED_ID, content: "   \n  " },
+    })) as any;
+    expect(empty.isError).toBe(true);
+    expect(parseToolJson(empty).error).toMatch(/non-empty/i);
+
+    const missing = (await ctx.client.callTool({
+      name: "doc_append",
+      arguments: { nodeId: "no-such-node-id", content: "valid body" },
+    })) as any;
+    expect(missing.isError).toBe(true);
+    expect(parseToolJson(missing).error).toMatch(/does not exist/);
+  });
+
+  test("12. task_update_status flips a Task's status + persists to frontmatter", async () => {
+    const list = await callTool(ctx.client, "kg_list_edges_from_file", {
+      sourceFile: EXPECTED_MD_PATH,
+    });
+    const taskId = list.edges[0].dstId;
+
+    const upd = await callTool(ctx.client, "task_update_status", {
+      nodeId: taskId,
+      status: "in_progress",
+    });
+    expect(upd.id).toBe(taskId);
+    expect(upd.newStatus).toBe("in_progress");
+
+    const taskAbs = join(ctx.vault, "tasks/gate-followup.md");
+    const raw = readFileSync(taskAbs, "utf8");
+    expect(raw).toMatch(/status:\s*in_progress/);
+
+    const second = await callTool(ctx.client, "task_update_status", {
+      nodeId: taskId,
+      status: "done",
+    });
+    expect(second.previousStatus).toBe("in_progress");
+    expect(second.newStatus).toBe("done");
+  });
+
+  test("13. task_update_status rejects non-Task nodes + invalid status enum", async () => {
+    const wrongType = (await ctx.client.callTool({
+      name: "task_update_status",
+      arguments: { nodeId: EXPECTED_ID, status: "done" },
+    })) as any;
+    expect(wrongType.isError).toBe(true);
+    expect(parseToolJson(wrongType).error).toMatch(/only Task nodes/);
+
+    const invalidStatus = (await ctx.client
+      .callTool({
+        name: "task_update_status",
+        arguments: { nodeId: EXPECTED_ID, status: "in-flight" },
+      })
+      .catch((err: Error) => ({ thrown: err.message }))) as any;
+    if (invalidStatus.thrown) {
+      expect(invalidStatus.thrown).toMatch(/invalid|enum|in-flight/i);
+    } else {
+      expect(invalidStatus.isError).toBe(true);
+    }
+  });
 });
