@@ -37,6 +37,20 @@ commit SHA when shipped.
 - [ ] Embedding dim switcher: if the chosen model's dim changes, drop and
   recreate `node_vec`. Gate on an explicit `kg reindex --reembed` flag
   so accidental runs don't wipe the vec store.
+- [ ] **Lane A dogfood (2026-04-15, `/tmp/lane-a-dogfood` over doc-mvp
+  vault, 5 files, 0 edges):**
+    - "Pure prose" vaults (design notes, planning docs) produce `edges=0`
+      because they lack frontmatter `edges:` and `[[wiki-links]]`. Search
+      still works but 1-hop expansion has nothing to expand, which hides
+      half of what makes this tool useful. Ship a `docs/authoring-guide.md`
+      that documents the minimum linking convention agents should write
+      when producing Meeting / Decision / Task docs, and consider a
+      `kg lint` command that flags nodes with zero outgoing edges.
+    - `kg import` on 5 files finished in 29ms with no per-file log.
+      Acceptable for small vaults, but for a 1000+ file Obsidian vault
+      the operator gets nothing between "started" and "done". Add an
+      opt-in `--verbose` flag that streams one line per file (path +
+      nodes/edges delta) so slow imports are debuggable.
 - [ ] **Lane C dogfood follow-ups** (`docs/dogfood-2026-04-15.md`): 4 fixes
   ordered by ROI — classify-as-postfilter (~40% FP at cap=15 → decision-only
   graph), filename byte cap for long Korean titles, VERBATIM substring
