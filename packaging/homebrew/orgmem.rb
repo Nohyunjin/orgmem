@@ -39,7 +39,7 @@ class Orgmem < Formula
   on_macos do
     on_arm do
       url "https://github.com/Nohyunjin/orgmem/releases/download/v#{version}/kg-darwin-arm64"
-      sha256 "REPLACE_WITH_SHA256_OF_kg-darwin-arm64_AFTER_RELEASE"
+      sha256 "84055b85b8ecebe1138188e7f05fc9805edfef3966841e9cfa977dc48d74e700"
     end
     # Intel macOS is not currently produced by release.yml. Add an
     # `on_intel do ... end` block here once the matrix adds darwin-x64.
@@ -47,25 +47,17 @@ class Orgmem < Formula
 
   on_linux do
     url "https://github.com/Nohyunjin/orgmem/releases/download/v#{version}/kg-linux-x86_64"
-    sha256 "REPLACE_WITH_SHA256_OF_kg-linux-x86_64_AFTER_RELEASE"
+    sha256 "f07bf850e24b7a4a3bc4642e188240a3cf4bc1a2c4894b55ecaa15c7cec40d64"
   end
 
   def install
-    # The download is a single bun-compiled binary named after its target
-    # platform. Install it as plain `kg` so users' PATH stays clean.
-    binary_name = if OS.mac? && Hardware::CPU.arm?
-                    "kg-darwin-arm64"
-                  elsif OS.linux?
-                    "kg-linux-x86_64"
-                  else
-                    odie "unsupported platform — only darwin-arm64 and linux-x86_64 are shipped"
-                  end
-    bin.install Dir["*"].first => "kg"
+    # Each platform's `url` block above downloads exactly one file named
+    # `kg-<target>` into the build dir. Install it as plain `kg` so the
+    # caller's PATH stays clean.
+    binary = Dir["kg-*"].first
+    odie "no kg binary found in download (Dir entries: #{Dir["*"].inspect})" if binary.nil?
+    bin.install binary => "kg"
     chmod 0755, bin/"kg"
-
-    # Sanity — refuse to install a tarball that somehow shipped the wrong
-    # architecture. `file` exits 0 with any output, so we grep the output.
-    ohai "installed as #{bin}/kg (from #{binary_name})"
   end
 
   test do
