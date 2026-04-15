@@ -120,9 +120,18 @@ If the server boots but `kg_search` reports unavailable, check:
 2. `kg embed` has run at least once on the vault.
 3. `kg doctor` shows `vecLoaded: true`. If not, the `ORGMEM_SQLITE_LIB` workaround may be needed on macOS.
 
+## Known limitations (2026-04-15 dogfood — temporary)
+
+Surfaced during the first real-vault run; tracked for fix in this iteration. This section will be removed once the underlying issues land.
+
+- **`decisions_extract` precision is ~60% on uncurated docs.** The extractor returns goals/metrics/action-items alongside real decisions. Lane C is wiring the V2 classifier as a post-filter; until it lands, MCP clients should treat extracted nodes as candidates and not auto-publish them downstream. Tracked in `docs/dogfood-2026-04-15.md` §1.
+- **`decisions_extract` is not byte-stable across re-runs at temperature=0.** Same source → ~⅔ different extracted text on the second call. Idempotency (deterministic id from `sha256(sourceDocId|text)`) only catches identical-text re-runs, so re-running today produces near-duplicate Decision nodes. Lane C is shipping text-similarity dedup; until then, don't loop `decisions_extract` on a schedule. Tracked in §2.
+- **`kg_create_node` may produce filenames near the 255-byte FS limit on long Korean (or other multi-byte) titles.** `titleFromText` caps at 80 chars but the slug isn't byte-capped. Lane A is adding a post-slug truncation + hash suffix in `src/graph/write.ts`. Until then, callers passing long non-ASCII titles should set an explicit `id` / `pathOverride` to avoid the edge case. Tracked in §3.
+- **VERBATIM rule drift in extracted text.** The extractor occasionally paraphrases across lines and reports a fabricated `source_line`. Lane C is adding a substring post-check in `extract.ts`. Until then, `decisions_extract` `extracted[i].line` should be treated as advisory, not load-bearing. Tracked in §4.
+
 ## Tests
 
 Two layers, both run on `bun test`:
 
 - `tests/mcp.test.ts` — InMemoryTransport, fast, exercises every tool's happy + error paths.
-- `tests/mcp-e2e.test.ts` — spawns `bun src/cli/kg.ts mcp` as a real child process via `StdioClientTransport`, validates the full protocol surface end-to-end including file-on-disk effects.
+- `tests/mcp-e2e.test.ts` — spawns `bun src/cli/kg.ts mcp` as a real child process via `StdioClientTransport`, validates the full protocol surface end-to-end including file-on-disk effects. Includes a `decisions_extract` describe block that injects a stub extractor via `ORGMEM_EXTRACTOR_STUB`.
