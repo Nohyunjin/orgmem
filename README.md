@@ -10,6 +10,48 @@ graph maintained by AI agents via MCP. Phase 1 of the
 
 ---
 
+## Install
+
+```bash
+npm install -g orgmem
+```
+
+Prerequisites (the postinstall check will tell you if something is
+missing):
+
+- [Bun](https://bun.sh) ≥ 1.1 on `PATH` — the `kg` CLI has a
+  `#!/usr/bin/env bun` shebang, so bun must be installed system-wide.
+- A SQLite build with loadable extension support (Apple's bundled
+  libsqlite3 does not qualify):
+    - macOS: `brew install sqlite`
+    - Linux: `sudo apt install libsqlite3-dev` (or your distro equivalent)
+    - Override path: `export ORGMEM_SQLITE_LIB=/path/to/libsqlite3.dylib`
+
+Then point `kg` at a markdown vault:
+
+```bash
+export ORGMEM_VAULT=~/path/to/your/vault        # any dir with .md files
+kg init                                         # apply migrations, verify vec
+kg import $ORGMEM_VAULT                         # materialize nodes + edges
+kg status                                       # node/edge/embed counts
+kg doctor                                       # full health check
+```
+
+Optional for search + ask:
+
+```bash
+export OPENAI_API_KEY=sk-...                    # required for kg embed / ask
+export ANTHROPIC_API_KEY=sk-ant-...             # required for kg ask
+kg embed --resume                               # backfill embeddings
+kg ask "what did we decide about payments?"
+```
+
+> Full install options (Homebrew tap, binary release, source) and the
+> Claude Code MCP setup walkthrough land in a later pass — track progress
+> in `TODO.md → Week 6 — distribution`.
+
+---
+
 ## Week 1 gate — all green
 
 | Check | Status | Evidence |
