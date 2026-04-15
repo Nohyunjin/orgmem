@@ -281,8 +281,11 @@ describe("mcp e2e (real stdio child process)", () => {
  */
 describe("mcp e2e — decisions_extract (stub-injected)", () => {
   const SOURCE_TITLE = "Payment redesign meeting";
-  const STUB_MATCH = "We will adopt MCP for agent integration";
+  // STUB_DECISION_TEXT must appear verbatim in the meeting body — Lane C's
+  // VERBATIM post-check (extract.ts) drops any extracted text that isn't a
+  // (normalized) substring of the source body.
   const STUB_DECISION_TEXT = "Adopt MCP as the primary agent integration surface";
+  const STUB_MATCH = STUB_DECISION_TEXT;
   const STUB_REASONING = "Stub: locked in during the meeting body";
 
   let dir: string;
@@ -351,7 +354,7 @@ describe("mcp e2e — decisions_extract (stub-injected)", () => {
     const meeting = await callTool(client, "kg_create_node", {
       type: "Meeting",
       title: SOURCE_TITLE,
-      content: `# ${SOURCE_TITLE}\n\nNotes:\n- ${STUB_MATCH}.\n- Roll out next sprint.`,
+      content: `# ${SOURCE_TITLE}\n\nNotes:\n- ${STUB_DECISION_TEXT}.\n- Roll out next sprint.`,
       date: "2026-04-15",
     });
     const before = await callTool(client, "kg_status", {});
@@ -418,5 +421,170 @@ describe("mcp e2e — decisions_extract (stub-injected)", () => {
     expect(res.created.length).toBe(0);
     expect(res.skipped.length).toBe(1);
     expect(res.skipped[0].alreadyPresent).toBe(true);
+  });
+});
+
+/**
+ * Verifies Lane C's dedup fix (commit 90dd539 — aggressive normalization in
+ * deriveDecisionId) at the MCP level. Simulates the real-world failure mode:
+ * the LLM returns *semantically* identical decisions across runs but with
+ * surface drift (punctuation, backticks, casing, whitespace). Pre-fix this
+ * produced N new Decision nodes per re-run; post-fix the normalization
+ * collapses them all to the same id and the pre-existing dedup absorbs them.
+ *
+ * Stub uses sequence mode so each call returns a different surface form of
+ * the same 3 underlying decisions.
+ */
+describe("mcp e2e — decisions_extract dedup (Lane C fix #2 verification)", () => {
+  // Three decisions, in three drifted surface forms. All three forms must
+  // collapse to the same id under normalizeForDedup (NFC + lowercase + strip
+  // every non-letter/non-digit/non-CJK char).
+  const SEMANTIC_DECISIONS = [
+    {
+      run1: "Adopt MCP as the primary agent integration surface",
+      run2: "Adopt MCP, as the primary agent-integration surface.",
+      run3: "**Adopt MCP** as the primary `agent integration` surface!",
+    },
+    {
+      run1: "Defer mobile client to Q3",
+      run2: "Defer mobile client to Q3.",
+      run3: "  defer  mobile-client  to Q3 ",
+    },
+    {
+      run1: "Cap LLM spend at $200/month per user",
+      run2: "Cap LLM spend at $200 / month per user.",
+      run3: "Cap **LLM** spend at `$200/month` per user",
+    },
+  ];
+
+  function buildExtractorResponse(forms: { run1: string; run2: string; run3: string }[], runIdx: 1 | 2 | 3): string {
+    const key = `run${runIdx}` as const;
+    return JSON.stringify({
+      decisions: forms.map((f, i) => ({
+        text: f[key],
+        reasoning: `Stub semantic #${i + 1}, drift run ${runIdx}`,
+        line: i + 5,
+      })),
+    });
+  }
+
+  let dir: string;
+  let vault: string;
+  let stubPath: string;
+  let client: Client;
+  let transport: StdioClientTransport;
+  let stderrBuf = "";
+
+  beforeAll(async () => {
+    dir = mkdtempSync(resolve(tmpdir(), "orgmem-e2e-dedup-"));
+    vault = join(dir, "vault");
+    const db = join(dir, "dev.db");
+    stubPath = join(dir, "extractor-stub.json");
+    const fs = await import("node:fs");
+    fs.mkdirSync(vault, { recursive: true });
+
+    const sequencePayload = {
+      mode: "sequence",
+      responses: [
+        buildExtractorResponse(SEMANTIC_DECISIONS, 1),
+        buildExtractorResponse(SEMANTIC_DECISIONS, 2),
+        buildExtractorResponse(SEMANTIC_DECISIONS, 3),
+      ],
+    };
+    writeFileSync(stubPath, JSON.stringify(sequencePayload), "utf8");
+
+    const repoRoot = resolve(import.meta.dir, "..");
+    transport = new StdioClientTransport({
+      command: process.execPath,
+      args: ["src/cli/kg.ts", "mcp"],
+      cwd: repoRoot,
+      env: {
+        PATH: process.env.PATH ?? "",
+        HOME: process.env.HOME ?? "",
+        ORGMEM_VAULT: vault,
+        ORGMEM_DB: db,
+        ORGMEM_EXTRACTOR_STUB: stubPath,
+      },
+      stderr: "pipe",
+    });
+    transport.stderr?.on("data", (chunk: Buffer) => {
+      stderrBuf += chunk.toString("utf8");
+    });
+    client = new Client({ name: "orgmem-e2e-dedup", version: "0.0.0" }, { capabilities: {} });
+    await client.connect(transport);
+  });
+
+  afterAll(async () => {
+    if (client) await client.close().catch(() => {});
+    if (dir) rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("3 consecutive decisions_extract calls on the same source: 3 created, 0 created, 0 created", async () => {
+    expect(stderrBuf).toContain("extract=stub");
+
+    // Body must contain every surface form the stub will return — Lane C's
+    // VERBATIM post-check drops any extracted text that isn't a (normalized)
+    // substring of the body. Listing every drift form keeps the dedup test
+    // independent of the verbatim filter.
+    const allForms = SEMANTIC_DECISIONS.flatMap((d) => [d.run1, d.run2, d.run3]);
+    const bodyLines = ["# Q2 planning sync", "", "Discussion notes:"];
+    for (const form of allForms) bodyLines.push(`- ${form}`);
+    const meeting = await callTool(client, "kg_create_node", {
+      type: "Meeting",
+      title: "Q2 planning sync",
+      content: bodyLines.join("\n") + "\n",
+      date: "2026-04-15",
+    });
+
+    const N = SEMANTIC_DECISIONS.length;
+
+    // Run 1 — first surface form. All N are new.
+    const run1 = await callTool(client, "decisions_extract", {
+      nodeId: meeting.id,
+      dryRun: false,
+      date: "2026-04-15",
+    });
+    expect(run1.extractedCount).toBe(N);
+    expect(run1.created.length).toBe(N);
+    expect(run1.skipped.length).toBe(0);
+    expect(run1.errors.length).toBe(0);
+    const run1Ids = run1.created.map((c: { id: string }) => c.id).sort();
+
+    // Run 2 — drifted surface form (commas, periods, hyphens). Pre-fix this
+    // would create ~N new nodes; post-fix all N normalize to the same id and
+    // are skipped.
+    const run2 = await callTool(client, "decisions_extract", {
+      nodeId: meeting.id,
+      dryRun: false,
+      date: "2026-04-15",
+    });
+    expect(run2.extractedCount).toBe(N);
+    expect(run2.created.length).toBe(0);
+    expect(run2.skipped.length).toBe(N);
+    expect(run2.errors.length).toBe(0);
+    const run2SkippedIds = run2.skipped.map((s: { id: string }) => s.id).sort();
+    expect(run2SkippedIds).toEqual(run1Ids);
+
+    // Run 3 — heavier drift (markdown emphasis, backticks, extra whitespace,
+    // trailing punctuation). Same outcome.
+    const run3 = await callTool(client, "decisions_extract", {
+      nodeId: meeting.id,
+      dryRun: false,
+      date: "2026-04-15",
+    });
+    expect(run3.extractedCount).toBe(N);
+    expect(run3.created.length).toBe(0);
+    expect(run3.skipped.length).toBe(N);
+    expect(run3.errors.length).toBe(0);
+    const run3SkippedIds = run3.skipped.map((s: { id: string }) => s.id).sort();
+    expect(run3SkippedIds).toEqual(run1Ids);
+
+    // Final graph state: exactly N Decision nodes (plus the Meeting source +
+    // any other nodes the test created).
+    const status = await callTool(client, "kg_status", {});
+    // 1 Meeting + N Decisions = N+1 nodes
+    expect(status.nodes).toBe(N + 1);
+    // N decided_in edges (one per Decision pointing back at the Meeting)
+    expect(status.edges).toBe(N);
   });
 });
