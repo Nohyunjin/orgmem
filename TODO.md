@@ -6,6 +6,25 @@ commit SHA when shipped.
 
 ## Week 6 — distribution
 
+- [ ] **macOS code-signing for the bun-compile binary.** Surfaced during
+  v0.1.0 release: the unsigned darwin-arm64 binary published by
+  release.yml is killed by macOS at launch (`exit 137 / SIGKILL`,
+  `codesign -dv` reports "code object is not signed at all"). The
+  in-CI smoke test inside release.yml passes because GitHub's macOS
+  runner has a more permissive policy than a typical user machine.
+  Fixes, in order of effort:
+    1. Cheap: add `codesign --sign - --force --timestamp dist/kg-darwin-arm64`
+       step to release.yml after the bun-compile step. Ad-hoc signature
+       satisfies macOS's "must be signed" rule but does NOT clear
+       Gatekeeper for downloaded binaries.
+    2. Medium: post-install instruction for users to run
+       `codesign --sign - --force /opt/homebrew/bin/kg` themselves.
+    3. Proper: enroll an Apple Developer ID, sign + notarize per
+       release. Requires paid account + secret management in
+       release.yml. Right answer long-term.
+  Linux binary is unaffected. Until fix lands, document the
+  workaround in the brew install section of README.
+
 - [ ] **sqlite-vec system dependency onboarding.** Currently vec load requires
   a separately-installed system SQLite with loadable extensions
   (`brew install sqlite` on macOS, `libsqlite3-dev` on Linux). On fresh
