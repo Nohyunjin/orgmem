@@ -55,6 +55,18 @@ jobs:
           chmod +x dist/kg-${{ matrix.target.name }}
           ls -la dist/
 
+      # macOS: bun --compile emits an ad-hoc "linker-signed" Mach-O, which
+      # current macOS rejects at launch when the binary wasn't built on
+      # the local machine (exit 137 / SIGKILL). Replace with an ordinary
+      # ad-hoc signature via `codesign --sign -` so any arm64 Mac can
+      # run the release binary. Proper Developer ID notarization is
+      # parked for v0.2 (see TODO.md → Week 6).
+      - name: Ad-hoc codesign (macOS only)
+        if: runner.os == 'macOS'
+        run: |
+          codesign --force --sign - dist/kg-${{ matrix.target.name }}
+          codesign --verify --verbose dist/kg-${{ matrix.target.name }}
+
       # Smoke test runs natively on the matching runner (macos-latest is
       # arm64, ubuntu-latest is x64). --version path writes a fixed string
       # and returns — no DB open, no sqlite dependency. If the binary is

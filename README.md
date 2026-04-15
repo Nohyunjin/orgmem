@@ -37,6 +37,30 @@ This installs the bun-compile single binary, so you don't need Bun or
 Node on PATH separately. `sqlite` (with loadable extensions) is pulled
 in as a Homebrew dependency.
 
+<details>
+<summary><strong>First run on macOS (ad-hoc signed binary)</strong></summary>
+
+The macOS binary is ad-hoc signed (not Developer-ID notarized — that
+lands in v0.2). With `v0.1.1+` the CI pipeline runs
+`codesign --sign -` before publishing, so `brew install` → `kg` works
+out of the box on any arm64 Mac.
+
+If you installed v0.1.0 (the first release, pre-codesign) and `kg`
+exits silently or with a "damaged app" dialog, either re-sign locally:
+
+```bash
+codesign --force --sign - "$(which kg)"
+```
+
+or strip Gatekeeper's quarantine flag:
+
+```bash
+xattr -d com.apple.quarantine "$(which kg)" 2>/dev/null || true
+```
+
+Upgrading to v0.1.1+ via `brew upgrade orgmem` is the cleanest fix.
+</details>
+
 ### Option B — npm (cross-platform)
 
 ```bash
