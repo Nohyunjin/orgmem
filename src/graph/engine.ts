@@ -77,6 +77,18 @@ export function upsertDocNodeAndEdges(handle: DbHandle, sourceFile: string, doc:
 
   handle.raw.exec("BEGIN IMMEDIATE;");
   try {
+    // Compare against any existing row to decide whether to flip
+    // embedding_status back to 'pending'. The contract from W2 is: new
+    // nodes or nodes whose content_hash changed need re-embedding; nodes
+    // whose content_hash is identical retain their prior status (so
+    // 'embedded' stays 'embedded' across no-op reindexes).
+    const existing = handle.raw
+      .prepare("SELECT content_hash, embedding_status FROM nodes WHERE id = ?;")
+      .get(doc.id) as { content_hash: string | null; embedding_status: string } | null;
+
+    const contentChanged = !existing || existing.content_hash !== doc.contentHash;
+    const nextEmbeddingStatus = contentChanged ? "pending" : existing.embedding_status;
+
     handle.db
       .insert(nodes)
       .values({
@@ -90,6 +102,7 @@ export function upsertDocNodeAndEdges(handle: DbHandle, sourceFile: string, doc:
         mtime: now,
         createdAt: now,
         updatedAt: now,
+        embeddingStatus: nextEmbeddingStatus,
       })
       .onConflictDoUpdate({
         target: nodes.id,
@@ -102,6 +115,7 @@ export function upsertDocNodeAndEdges(handle: DbHandle, sourceFile: string, doc:
           contentHash: doc.contentHash,
           mtime: now,
           updatedAt: now,
+          embeddingStatus: nextEmbeddingStatus,
         },
       })
       .run();

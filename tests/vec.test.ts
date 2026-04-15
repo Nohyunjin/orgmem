@@ -29,24 +29,28 @@ describe("sqlite-vec extension", () => {
     }
   });
 
-  test("can create and query a vec0 virtual table", () => {
+  test("can insert + kNN-query the auto-bootstrapped node_vec (1536-dim)", () => {
     const handle = openDb({ path: dbPath, loadVec: true });
     try {
-      ensureVecTable(handle, 4);
+      // openDb auto-creates node_vec at the configured EMBEDDING_DIM (1536)
+      // so we don't call ensureVecTable here — we just verify the table
+      // exists and round-trips a typed Float32 vector.
       handle.raw.exec("DELETE FROM node_vec;");
-      const vecA = new Uint8Array(new Float32Array([1, 0, 0, 0]).buffer);
-      const vecB = new Uint8Array(new Float32Array([0, 1, 0, 0]).buffer);
+      const a = new Float32Array(1536);
+      a[0] = 1;
+      const b = new Float32Array(1536);
+      b[1] = 1;
       handle.raw
         .prepare("INSERT INTO node_vec (node_id, embedding) VALUES (?, ?);")
-        .run("node-a", vecA);
+        .run("node-a", new Uint8Array(a.buffer));
       handle.raw
         .prepare("INSERT INTO node_vec (node_id, embedding) VALUES (?, ?);")
-        .run("node-b", vecB);
+        .run("node-b", new Uint8Array(b.buffer));
       const rows = handle.raw
         .prepare(
           "SELECT node_id, distance FROM node_vec WHERE embedding MATCH ? AND k = 2 ORDER BY distance;",
         )
-        .all(vecA) as Array<{ node_id: string; distance: number }>;
+        .all(new Uint8Array(a.buffer)) as Array<{ node_id: string; distance: number }>;
       expect(rows.length).toBe(2);
       expect(rows[0]?.node_id).toBe("node-a");
       expect(rows[0]?.distance).toBeCloseTo(0, 5);

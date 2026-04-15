@@ -4,6 +4,7 @@ import { existsSync, mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import * as sqliteVec from "sqlite-vec";
 import * as schema from "./schema.ts";
+import { EMBEDDING_DIM } from "../embeddings/model.ts";
 
 export interface OpenOptions {
   /** Absolute DB path. */
@@ -90,7 +91,22 @@ export function openDb(opts: OpenOptions): DbHandle {
   }
 
   const db = drizzle(raw, { schema });
-  return { raw, db, path: abs, vecLoaded, vecError };
+  const handle: DbHandle = { raw, db, path: abs, vecLoaded, vecError };
+  if (vecLoaded) {
+    // vec0 virtual tables live outside the drizzle schema / schema_version
+    // bookkeeping because they depend on the extension being loaded at
+    // create-time. CREATE IF NOT EXISTS makes this idempotent — no risk
+    // of churn on repeat opens.
+    try {
+      ensureVecTable(handle, EMBEDDING_DIM);
+    } catch (err) {
+      // If this fails we degrade to the same state as vec-not-loaded so
+      // that search paths throw loudly and writes still work.
+      handle.vecLoaded = false;
+      handle.vecError = `node_vec bootstrap: ${(err as Error).message}`;
+    }
+  }
+  return handle;
 }
 
 export function closeDb(handle: DbHandle): void {

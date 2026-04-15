@@ -5,6 +5,9 @@ import { openDb, defaultDbPath } from "../storage/sqlite.ts";
 import { runMigrations } from "../storage/migrate.ts";
 import { importVault } from "../vault/import.ts";
 import { countEdges, countNodes } from "../graph/engine.ts";
+import { createOpenAIClient } from "../embeddings/client.ts";
+import { runBackfill } from "../embeddings/backfill.ts";
+import { EMBEDDING_MODEL } from "../embeddings/model.ts";
 
 function printHelp(): void {
   process.stdout.write(
@@ -13,14 +16,21 @@ function printHelp(): void {
 Commands:
   kg init [db]              Run migrations against the DB (default: $ORGMEM_DB or .orgmem/dev.db)
   kg import <vault-path>    Walk a vault and upsert every markdown file as a node (+ edges)
-  kg status                 Print node/edge counts + vec status
+  kg embed --resume         Backfill embeddings for all 'pending' nodes (resumable, 429 backoff)
+                              flags: --batch-size N (default 32), --max-batches N, --retry-failed
+  kg mcp [--vault <path>]   Start the stdio MCP server (Claude Code / Cursor)
+                              falls back to $ORGMEM_VAULT if --vault omitted
+  kg status                 Print node/edge counts + vec status + embedding queue
   kg doctor                 Diagnose sqlite-vec availability
   kg --version
   kg --help
 
 Env:
   ORGMEM_DB                 DB path (default: .orgmem/dev.db)
+  ORGMEM_VAULT              Vault dir (required for 'kg mcp' unless --vault is given)
   ORGMEM_SQLITE_LIB         Override system SQLite lib path (for sqlite-vec load)
+  OPENAI_API_KEY            Required for 'kg embed'; enables 'kg_search' in MCP when set
+  ANTHROPIC_API_KEY         Required for 'kg ask' (W2.4)
 `,
   );
 }
@@ -67,6 +77,43 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (cmd === "embed") {
+    // Accept both `kg embed --resume` and `kg embed` (same behavior — the
+    // command IS always resumable; --resume is a readability flag).
+    const args = parseEmbedArgs(rest);
+    const apiKey = process.env.OPENAI_API_KEY;
+    if (!apiKey) {
+      process.stderr.write(
+        "OPENAI_API_KEY is required for 'kg embed'. Export it and re-run.\n",
+      );
+      process.exit(2);
+    }
+    runMigrations();
+    const handle = openDb({ path: defaultDbPath(), loadVec: true });
+    try {
+      const client = createOpenAIClient({ apiKey });
+      const report = await runBackfill(handle, client, {
+        batchSize: args.batchSize,
+        maxBatches: args.maxBatches,
+        retryFailed: args.retryFailed,
+        onProgress: (ev) => {
+          if (ev.phase === "batch") {
+            process.stderr.write(
+              `[embed] batch ${String(ev.batchIndex)} (+${ev.batchSize ?? 0}): ` +
+                `${ev.processed}/${ev.total} processed, ${ev.failed} failed\n`,
+            );
+          }
+        },
+      });
+      process.stdout.write(
+        JSON.stringify({ ...report, model: EMBEDDING_MODEL }, null, 2) + "\n",
+      );
+    } finally {
+      handle.raw.close();
+    }
+    return;
+  }
+
   if (cmd === "status") {
     if (!existsSync(defaultDbPath())) {
       process.stdout.write(JSON.stringify({ db: defaultDbPath(), exists: false }, null, 2) + "\n");
@@ -74,6 +121,11 @@ async function main(): Promise<void> {
     }
     const handle = openDb({ path: defaultDbPath(), loadVec: true });
     try {
+      const statusRows = handle.raw
+        .prepare("SELECT embedding_status AS s, COUNT(*) AS c FROM nodes GROUP BY embedding_status;")
+        .all() as Array<{ s: string; c: number }>;
+      const embedQueue: Record<string, number> = { pending: 0, embedded: 0, failed: 0 };
+      for (const r of statusRows) embedQueue[r.s] = r.c;
       const out = {
         db: handle.path,
         exists: true,
@@ -81,11 +133,32 @@ async function main(): Promise<void> {
         edges: countEdges(handle),
         vecLoaded: handle.vecLoaded,
         vecError: handle.vecError ?? null,
+        embedQueue,
       };
       process.stdout.write(JSON.stringify(out, null, 2) + "\n");
     } finally {
       handle.raw.close();
     }
+    return;
+  }
+
+  if (cmd === "mcp") {
+    const { startStdio } = await import("../mcp/start.ts");
+    let vault: string | undefined;
+    for (let i = 0; i < rest.length; i++) {
+      const a = rest[i];
+      if (a === "--vault") {
+        vault = rest[++i];
+        if (!vault) {
+          process.stderr.write("--vault requires a path argument\n");
+          process.exit(2);
+        }
+        continue;
+      }
+      process.stderr.write(`unknown flag for 'kg mcp': ${a}\n`);
+      process.exit(2);
+    }
+    await startStdio({ vault });
     return;
   }
 
@@ -112,6 +185,42 @@ async function main(): Promise<void> {
 
   process.stderr.write(`unknown command: ${cmd}\nrun 'kg --help' for usage\n`);
   process.exit(2);
+}
+
+interface EmbedArgs {
+  batchSize?: number;
+  maxBatches?: number;
+  retryFailed?: boolean;
+}
+
+function parseEmbedArgs(rest: string[]): EmbedArgs {
+  const out: EmbedArgs = {};
+  for (let i = 0; i < rest.length; i++) {
+    const a = rest[i];
+    if (a === "--resume") continue;
+    if (a === "--retry-failed") {
+      out.retryFailed = true;
+      continue;
+    }
+    if (a === "--batch-size") {
+      const n = Number(rest[++i]);
+      if (!Number.isFinite(n) || n <= 0) {
+        throw new Error(`invalid --batch-size value`);
+      }
+      out.batchSize = Math.floor(n);
+      continue;
+    }
+    if (a === "--max-batches") {
+      const n = Number(rest[++i]);
+      if (!Number.isFinite(n) || n <= 0) {
+        throw new Error(`invalid --max-batches value`);
+      }
+      out.maxBatches = Math.floor(n);
+      continue;
+    }
+    throw new Error(`unknown flag: ${a}`);
+  }
+  return out;
 }
 
 main().catch((err) => {

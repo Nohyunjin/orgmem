@@ -25,10 +25,17 @@ export const nodes = sqliteTable(
     mtime: integer("mtime", { mode: "number" }),
     createdAt: integer("created_at", { mode: "number" }).notNull(),
     updatedAt: integer("updated_at", { mode: "number" }).notNull(),
+    // 3-state: 'pending' (needs embedding), 'embedded' (vec0 row exists,
+    // content_hash unchanged), 'failed' (last attempt errored; stays out
+    // of the retry set until a backfill --retry-failed flag flips it back).
+    embeddingStatus: text("embedding_status").notNull().default("pending"),
+    embeddingError: text("embedding_error"),
+    embeddingUpdatedAt: integer("embedding_updated_at", { mode: "number" }),
   },
   (t) => ({
     byType: index("nodes_type_idx").on(t.type),
     bySourceFile: index("nodes_source_file_idx").on(t.sourceFile),
+    byEmbeddingStatus: index("nodes_embedding_status_idx").on(t.embeddingStatus),
   }),
 );
 
