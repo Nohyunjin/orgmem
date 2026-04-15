@@ -48,18 +48,35 @@ function todayIsoDate(): string {
 }
 
 /**
+ * Aggressively normalize an extracted decision text for dedup.
+ *
+ * Why aggressive: at temperature=0 the extractor still produces byte-level
+ * variations between runs (different punctuation, backtick placement,
+ * markdown emphasis). Lane C dogfood (2026-04-15) showed re-running on
+ * the same doc produced ~2/3 "new" decisions with the same semantic
+ * content. Stripping every non-letter/digit/CJK character makes the
+ * hash tolerant to those surface edits while still distinguishing
+ * genuinely different decisions.
+ */
+function normalizeForDedup(text: string): string {
+  return text
+    .normalize("NFC")
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, "");
+}
+
+/**
  * Deterministic Decision id:
- *   decision-<date>-<sha256(sourceDocId|normalizedText).slice(0,10)>
+ *   decision-<date>-<sha256(sourceDocId|aggressively_normalized_text).slice(0,10)>
  *
  * Why:
- *   - Idempotent: same (sourceDocId, text, date) → same id → re-runs detect
- *     existing Decision and skip.
+ *   - Idempotent across LLM drift (see `normalizeForDedup` for why).
  *   - Opaque suffix: avoids ugly long slugs for extractor-authored nodes.
  *   - Retains date prefix: consistent with the Decision TYPE_DIR convention
  *     (`decisions/<date>-<slug>.md`).
  */
 function deriveDecisionId(sourceDocId: string, text: string, date: string): string {
-  const normalized = text.trim().replace(/\s+/g, " ").toLowerCase();
+  const normalized = normalizeForDedup(text);
   const h = createHash("sha256").update(`${sourceDocId}|${normalized}`).digest("hex");
   return `decision-${date}-${h.slice(0, 10)}`;
 }

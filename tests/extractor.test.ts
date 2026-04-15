@@ -206,6 +206,69 @@ describe("materializeDecisions", () => {
     }
   });
 
+  test("tolerates LLM punctuation/whitespace drift (dogfood-2 fix)", () => {
+    // Real-world non-determinism surfaced during Lane C dogfood: at
+    // temperature=0 the extractor still drifts on surface form — different
+    // backticks, extra commas, markdown emphasis. Aggressive normalization
+    // makes the deterministic id survive those edits.
+    const sourceId = seedSourceDoc(
+      handle,
+      ws.vault,
+      "docs/design.md",
+      `---\nid: document-design\ntype: Document\ntitle: Design\n---\n\nbody\n`,
+    );
+
+    const run1: ExtractedDecision[] = [
+      { text: "Source of truth: 마크다운 파일의 프론트매터. SQLite는 캐시.", reasoning: "r", line: 7 },
+      { text: "에이전트 프로토콜: MCP 표준 사용.", reasoning: "r", line: 12 },
+    ];
+    // Same decisions, different surface form (LLM drift):
+    //   - backtick-wrapped identifier
+    //   - trailing period removed
+    //   - leading "**" bold markers
+    //   - extra whitespace
+    const run2: ExtractedDecision[] = [
+      { text: "**Source of truth**:  `마크다운 파일의 프론트매터`. SQLite는 캐시", reasoning: "r", line: 7 },
+      { text: "에이전트 프로토콜: **MCP 표준** 사용.", reasoning: "r", line: 12 },
+    ];
+
+    const first = materializeDecisions(handle, ws.vault, sourceId, run1);
+    expect(first.created.length).toBe(2);
+
+    const before = countNodes(handle);
+    const second = materializeDecisions(handle, ws.vault, sourceId, run2);
+    expect(second.created.length).toBe(0); // drift absorbed by aggressive normalization
+    expect(second.skipped.length).toBe(2);
+    expect(countNodes(handle)).toBe(before);
+  });
+
+  test("three consecutive runs on identical input → node count stable", () => {
+    // Hard regression guard against dogfood issue (2): "running 3× creates
+    // many duplicates because temperature=0 still drifts text". With the
+    // aggressive-normalization id, N runs on the same ExtractedDecision set
+    // must be equivalent to 1 run + (N-1) no-ops.
+    const sourceId = seedSourceDoc(
+      handle,
+      ws.vault,
+      "docs/design.md",
+      `---\nid: document-design\ntype: Document\ntitle: Design\n---\n\nbody\n`,
+    );
+    const extracted: ExtractedDecision[] = [
+      { text: "Approach C: CHOSEN", reasoning: "r", line: 7 },
+      { text: "MVP에서 제외: GUI", reasoning: "r", line: 12 },
+      { text: "동시성: 파일 단위 soft lock + last-write-wins", reasoning: "r", line: 20 },
+    ];
+
+    materializeDecisions(handle, ws.vault, sourceId, extracted);
+    const after1 = countNodes(handle);
+
+    materializeDecisions(handle, ws.vault, sourceId, extracted);
+    expect(countNodes(handle)).toBe(after1);
+
+    materializeDecisions(handle, ws.vault, sourceId, extracted);
+    expect(countNodes(handle)).toBe(after1);
+  });
+
   test("rejects an unknown source doc", () => {
     expect(() =>
       materializeDecisions(handle, ws.vault, "document-does-not-exist", [
