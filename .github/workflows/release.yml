@@ -1,0 +1,111 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  # Manual dispatch is handy for rebuilding a tag after a release.yml fix
+  # without cutting a new version number.
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build (${{ matrix.target.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - name: darwin-arm64
+            os: macos-latest
+            bun: bun-darwin-arm64
+          - name: linux-x86_64
+            os: ubuntu-latest
+            bun: bun-linux-x64
+    runs-on: ${{ matrix.target.os }}
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install deps (frozen lockfile)
+        run: bun install --frozen-lockfile
+
+      # bun build --compile produces a single-file executable with the
+      # Bun runtime embedded. The resulting binary still loads the host's
+      # system libsqlite3 at runtime (via sqlite-vec's Database.setCustomSQLite),
+      # so end users still need `brew install sqlite` / `apt install libsqlite3-dev`.
+      # We do NOT need system SQLite at build time — the compile step only
+      # bundles JS + TS sources.
+      - name: Compile kg binary
+        run: |
+          mkdir -p dist
+          bun build ./src/cli/kg.ts \
+            --compile \
+            --target=${{ matrix.target.bun }} \
+            --outfile dist/kg-${{ matrix.target.name }}
+          chmod +x dist/kg-${{ matrix.target.name }}
+          ls -la dist/
+
+      # Smoke test runs natively on the matching runner (macos-latest is
+      # arm64, ubuntu-latest is x64). --version path writes a fixed string
+      # and returns — no DB open, no sqlite dependency. If the binary is
+      # broken at a fundamental level (missing symbols, wrong arch), this
+      # fails loud.
+      - name: Smoke test --version
+        run: dist/kg-${{ matrix.target.name }} --version
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kg-${{ matrix.target.name }}
+          path: dist/kg-${{ matrix.target.name }}
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish GitHub Release
+    needs: [build]
+    runs-on: ubuntu-latest
+    permissions:
+      # softprops/action-gh-release needs write access to create / update
+      # the release under the pushed tag.
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      # actions/download-artifact@v4 flattens each artifact into its own
+      # subdirectory. Collect all of them into a single release/ dir so
+      # action-gh-release can glob them in one shot.
+      - name: Collect binaries
+        run: |
+          mkdir -p release
+          for d in dist/*/; do
+            for f in "$d"*; do
+              base=$(basename "$f")
+              cp "$f" "release/$base"
+              chmod +x "release/$base"
+            done
+          done
+          ls -la release/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          draft: false
+          prerelease: false
+          generate_release_notes: true
