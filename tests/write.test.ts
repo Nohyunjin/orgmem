@@ -7,9 +7,12 @@ import { openDb, type DbHandle } from "../src/storage/sqlite.ts";
 import {
   createNode,
   createEdge,
+  appendToNode,
+  updateNodeStatus,
   getNode,
   listEdgesFromFile,
   slugify,
+  TASK_STATUSES,
 } from "../src/graph/index.ts";
 import { parseDoc } from "../src/vault/parser.ts";
 import { SelfWriteTracker } from "../src/vault/watcher.ts";
@@ -233,5 +236,197 @@ describe("createEdge", () => {
         sourceLine: 5,
       }),
     ).toThrow(/non-zero sourceLine is not supported/);
+  });
+});
+
+describe("appendToNode", () => {
+  let ws: ReturnType<typeof mkWorkspace>;
+  let handle: DbHandle;
+
+  beforeEach(() => {
+    ws = mkWorkspace();
+    runMigrations(ws.db);
+    handle = openDb({ path: ws.db, loadVec: true });
+  });
+  afterEach(() => {
+    handle.raw.close();
+    rmSync(ws.dir, { recursive: true, force: true });
+  });
+
+  test("appends a blank-line-separated block to an existing Meeting", () => {
+    const m = createNode(handle, ws.vault, {
+      type: "Meeting",
+      title: "Weekly sync",
+      date: "2026-04-15",
+      content: "# Weekly sync\n\nInitial agenda.\n",
+    });
+    const r = appendToNode(handle, ws.vault, m.id, "New note: API latency discussion.");
+    expect(r.id).toBe(m.id);
+    expect(r.sourceFile).toBe(m.mdPath);
+
+    const raw = readFileSync(m.absPath, "utf8");
+    expect(raw).toContain("Initial agenda.");
+    expect(raw).toContain("New note: API latency discussion.");
+    // Blank line separator between the two bodies.
+    expect(raw).toMatch(/Initial agenda\.\n\nNew note: API latency discussion\.\n$/);
+  });
+
+  test("twice-appended is NOT idempotent — both blocks present", () => {
+    const m = createNode(handle, ws.vault, {
+      type: "Meeting",
+      title: "Standup",
+      date: "2026-04-15",
+    });
+    appendToNode(handle, ws.vault, m.id, "first");
+    appendToNode(handle, ws.vault, m.id, "second");
+    const raw = readFileSync(m.absPath, "utf8");
+    // Both blocks must be present, separated by blank lines.
+    expect(raw).toContain("first");
+    expect(raw).toContain("second");
+    const firstIdx = raw.indexOf("first");
+    const secondIdx = raw.indexOf("second");
+    expect(firstIdx).toBeLessThan(secondIdx);
+  });
+
+  test("preserves frontmatter edges across append", () => {
+    const dst = createNode(handle, ws.vault, {
+      type: "Decision",
+      title: "Go with Toss",
+      date: "2026-04-10",
+    });
+    const m = createNode(handle, ws.vault, {
+      type: "Meeting",
+      title: "Kickoff",
+      date: "2026-04-15",
+      edges: [{ to: dst.id, relation: "decides" }],
+    });
+    appendToNode(handle, ws.vault, m.id, "follow-up note");
+    const raw = readFileSync(m.absPath, "utf8");
+    const parsed = parseDoc({ relPath: m.mdPath, raw });
+    expect(parsed.fmEdges.some((e) => e.to === dst.id && e.relation === "decides")).toBe(true);
+    expect(parsed.body).toContain("follow-up note");
+  });
+
+  test("flips embedding_status back to 'pending' after content change", () => {
+    const m = createNode(handle, ws.vault, {
+      type: "Meeting",
+      title: "Retro",
+      date: "2026-04-15",
+    });
+    // Manually mark as embedded to prove append flips it back.
+    handle.raw
+      .prepare("UPDATE nodes SET embedding_status = 'embedded' WHERE id = ?;")
+      .run(m.id);
+    appendToNode(handle, ws.vault, m.id, "late addition");
+    const row = handle.raw
+      .prepare("SELECT embedding_status FROM nodes WHERE id = ?;")
+      .get(m.id) as { embedding_status: string };
+    expect(row.embedding_status).toBe("pending");
+  });
+
+  test("empty content is rejected", () => {
+    const m = createNode(handle, ws.vault, { type: "Meeting", title: "x", date: "2026-01-01" });
+    expect(() => appendToNode(handle, ws.vault, m.id, "   \n\t  ")).toThrow(
+      /content must be non-empty/,
+    );
+  });
+
+  test("missing node is rejected", () => {
+    expect(() => appendToNode(handle, ws.vault, "nope-no-such-node", "x")).toThrow(
+      /does not exist/,
+    );
+  });
+
+  test("self-write is registered", () => {
+    const tracker = new SelfWriteTracker();
+    const m = createNode(handle, ws.vault, { type: "Meeting", title: "traced", date: "2026-04-15" });
+    appendToNode(handle, ws.vault, m.id, "hello", tracker);
+    expect(tracker.wasRecentSelfWrite(m.absPath)).toBe(true);
+  });
+});
+
+describe("updateNodeStatus", () => {
+  let ws: ReturnType<typeof mkWorkspace>;
+  let handle: DbHandle;
+
+  beforeEach(() => {
+    ws = mkWorkspace();
+    runMigrations(ws.db);
+    handle = openDb({ path: ws.db, loadVec: true });
+  });
+  afterEach(() => {
+    handle.raw.close();
+    rmSync(ws.dir, { recursive: true, force: true });
+  });
+
+  test("sets frontmatter.status on a Task and preserves body + other FM keys", () => {
+    const t = createNode(handle, ws.vault, {
+      type: "Task",
+      title: "Ship Toss",
+      content: "# Ship Toss\n\nBody stays put.\n",
+      metadata: { owner: "hyunjin", priority: "P1" },
+    });
+    const r = updateNodeStatus(handle, ws.vault, t.id, "in_progress");
+    expect(r.previousStatus).toBeNull();
+    expect(r.newStatus).toBe("in_progress");
+
+    const raw = readFileSync(t.absPath, "utf8");
+    const parsed = parseDoc({ relPath: t.mdPath, raw });
+    expect(parsed.frontmatter.status).toBe("in_progress");
+    expect(parsed.frontmatter.owner).toBe("hyunjin");
+    expect(parsed.frontmatter.priority).toBe("P1");
+    expect(parsed.body).toContain("Body stays put.");
+  });
+
+  test("returns the previous status when the node was already statused", () => {
+    const t = createNode(handle, ws.vault, {
+      type: "Task",
+      title: "Stage",
+      metadata: { status: "todo" },
+    });
+    const r = updateNodeStatus(handle, ws.vault, t.id, "done");
+    expect(r.previousStatus).toBe("todo");
+    expect(r.newStatus).toBe("done");
+  });
+
+  test("rejects non-Task nodes", () => {
+    const d = createNode(handle, ws.vault, { type: "Document", title: "Spec" });
+    expect(() => updateNodeStatus(handle, ws.vault, d.id, "done")).toThrow(
+      /only Task nodes have a status field/,
+    );
+  });
+
+  test("rejects invalid status values", () => {
+    const t = createNode(handle, ws.vault, { type: "Task", title: "X" });
+    expect(() => updateNodeStatus(handle, ws.vault, t.id, "in-progress")).toThrow(
+      /invalid status/,
+    );
+    expect(() => updateNodeStatus(handle, ws.vault, t.id, "")).toThrow(/invalid status/);
+  });
+
+  test("rejects missing nodes", () => {
+    expect(() => updateNodeStatus(handle, ws.vault, "task-nope", "done")).toThrow(
+      /does not exist/,
+    );
+  });
+
+  test("flips embedding_status back to 'pending'", () => {
+    const t = createNode(handle, ws.vault, { type: "Task", title: "Flip me" });
+    handle.raw
+      .prepare("UPDATE nodes SET embedding_status = 'embedded' WHERE id = ?;")
+      .run(t.id);
+    updateNodeStatus(handle, ws.vault, t.id, "done");
+    const row = handle.raw
+      .prepare("SELECT embedding_status FROM nodes WHERE id = ?;")
+      .get(t.id) as { embedding_status: string };
+    expect(row.embedding_status).toBe("pending");
+  });
+
+  test("all TASK_STATUSES are accepted", () => {
+    const t = createNode(handle, ws.vault, { type: "Task", title: "Cycle" });
+    for (const s of TASK_STATUSES) {
+      const r = updateNodeStatus(handle, ws.vault, t.id, s);
+      expect(r.newStatus).toBe(s);
+    }
   });
 });

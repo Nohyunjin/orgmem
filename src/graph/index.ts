@@ -20,12 +20,23 @@ export {
 } from "./engine.ts";
 export type { UpsertResult, NodeRow } from "./engine.ts";
 
-export { createNode, createEdge, slugify } from "./write.ts";
+export {
+  createNode,
+  createEdge,
+  appendToNode,
+  updateNodeStatus,
+  slugify,
+  TASK_STATUSES,
+  isTaskStatus,
+} from "./write.ts";
 export type {
   CreateNodeInput,
   CreateNodeResult,
   CreateEdgeInput,
   CreateEdgeResult,
+  AppendToNodeResult,
+  UpdateNodeStatusResult,
+  TaskStatus,
 } from "./write.ts";
 
 export { search, formatHits } from "./search.ts";

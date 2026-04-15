@@ -339,3 +339,205 @@ export function createEdge(
     alreadyPresent: false,
   };
 }
+
+/**
+ * Allowed values for a Task node's frontmatter `status` field. Kept narrow
+ * on purpose: this is the vocabulary Lane B's `task_update_status` tool
+ * will validate against, and loosening it later is cheap; tightening is
+ * expensive (agents will have written whatever they want to MD files).
+ */
+export const TASK_STATUSES = [
+  "todo",
+  "in_progress",
+  "blocked",
+  "done",
+  "cancelled",
+] as const;
+export type TaskStatus = (typeof TASK_STATUSES)[number];
+
+export function isTaskStatus(v: unknown): v is TaskStatus {
+  return typeof v === "string" && (TASK_STATUSES as readonly string[]).includes(v);
+}
+
+export interface AppendToNodeResult {
+  id: string;
+  sourceFile: string;
+  absPath: string;
+  appendedChars: number;
+}
+
+/**
+ * Append text to an existing node's markdown body, preserving frontmatter
+ * (incl. edges and any third-party keys) and existing body content.
+ *
+ * NOT idempotent: calling twice with the same content appends two blocks.
+ * That's the whole point — this exists for meeting-minute / daily-log
+ * patterns where the agent streams updates into an existing node.
+ *
+ * Side effects:
+ *   - File rewritten on disk with a blank-line separator between prior
+ *     body and the appended block.
+ *   - SelfWriteTracker notified (so a live FS watcher won't re-trigger).
+ *   - Node reindexed; because raw bytes changed, engine flips
+ *     `embedding_status` back to 'pending' (next `kg embed` will pick it up).
+ *
+ * Rejects when:
+ *   - nodeId does not exist
+ *   - node has no source_file (agent-only / unsupported)
+ *   - content is empty/whitespace (silent append is almost always a bug)
+ */
+export function appendToNode(
+  handle: DbHandle,
+  vaultPath: string,
+  nodeId: string,
+  content: string,
+  tracker?: SelfWriteTracker,
+): AppendToNodeResult {
+  const trimmedContent = content.replace(/\s+$/, "");
+  if (trimmedContent.length === 0) {
+    throw new Error("appendToNode: content must be non-empty (whitespace-only append rejected).");
+  }
+
+  const row = handle.db.select().from(nodes).where(eq(nodes.id, nodeId)).get();
+  if (!row) {
+    throw new Error(`appendToNode: node '${nodeId}' does not exist`);
+  }
+  if (!row.sourceFile) {
+    throw new Error(
+      `appendToNode: node '${nodeId}' has no source_file on disk — only file-backed nodes can be appended to`,
+    );
+  }
+
+  const vault = resolve(vaultPath);
+  const relPath = row.sourceFile;
+  const absPath = resolve(vault, relPath);
+  if (!existsSync(absPath)) {
+    throw new Error(`appendToNode: source file missing on disk: ${absPath}`);
+  }
+  const rel = relative(vault, absPath);
+  if (rel.startsWith("..")) {
+    throw new Error(`appendToNode: source file resolves outside the vault: ${absPath}`);
+  }
+
+  const raw = readFileSync(absPath, "utf8");
+  const parsed = parseDoc({ relPath, raw });
+
+  // Strip trailing whitespace from existing body, then insert a single
+  // blank-line separator before the new block. Final file always ends
+  // with exactly one newline.
+  const existingBodyTrimmed = parsed.body.replace(/\s+$/, "");
+  const newBody =
+    existingBodyTrimmed.length === 0
+      ? `${trimmedContent}\n`
+      : `${existingBodyTrimmed}\n\n${trimmedContent}\n`;
+
+  const rewritten = serializeDoc({ ...parsed, body: newBody });
+
+  tracker?.markSelfWrite(absPath);
+  writeFileSync(absPath, rewritten, "utf8");
+
+  const reread = readFileSync(absPath, "utf8");
+  const reparsed = parseDoc({ relPath, raw: reread });
+  upsertDocNodeAndEdges(handle, relPath, reparsed);
+
+  return {
+    id: nodeId,
+    sourceFile: relPath,
+    absPath,
+    appendedChars: trimmedContent.length,
+  };
+}
+
+export interface UpdateNodeStatusResult {
+  id: string;
+  sourceFile: string;
+  absPath: string;
+  previousStatus: TaskStatus | null;
+  newStatus: TaskStatus;
+}
+
+/**
+ * Set the `status` field in a Task node's frontmatter. All other frontmatter
+ * keys (including `edges:`) and the body are preserved byte-for-byte at the
+ * parsed-doc level (YAML is re-serialized, so key order within the
+ * frontmatter block may normalize — see parser.ts notes).
+ *
+ * Rejects when:
+ *   - nodeId does not exist
+ *   - node is not type='Task' (other types have no status vocabulary yet)
+ *   - newStatus is not in TASK_STATUSES
+ *
+ * Side effects (same as appendToNode):
+ *   - File rewritten, SelfWriteTracker notified.
+ *   - content_hash changes (frontmatter bytes differ) → engine flips
+ *     embedding_status back to 'pending'. This is slightly wasteful for
+ *     pure-metadata changes, but it's simpler than teaching the engine
+ *     to distinguish metadata-only diffs from body diffs, and re-embedding
+ *     is cheap at this scale.
+ */
+export function updateNodeStatus(
+  handle: DbHandle,
+  vaultPath: string,
+  nodeId: string,
+  newStatus: string,
+  tracker?: SelfWriteTracker,
+): UpdateNodeStatusResult {
+  if (!isTaskStatus(newStatus)) {
+    throw new Error(
+      `updateNodeStatus: invalid status '${newStatus}'. Allowed: ${TASK_STATUSES.join(", ")}`,
+    );
+  }
+
+  const row = handle.db.select().from(nodes).where(eq(nodes.id, nodeId)).get();
+  if (!row) {
+    throw new Error(`updateNodeStatus: node '${nodeId}' does not exist`);
+  }
+  if (row.type !== "Task") {
+    throw new Error(
+      `updateNodeStatus: node '${nodeId}' is type '${row.type}'; only Task nodes have a status field`,
+    );
+  }
+  if (!row.sourceFile) {
+    throw new Error(
+      `updateNodeStatus: node '${nodeId}' has no source_file on disk — nothing to rewrite`,
+    );
+  }
+
+  const vault = resolve(vaultPath);
+  const relPath = row.sourceFile;
+  const absPath = resolve(vault, relPath);
+  if (!existsSync(absPath)) {
+    throw new Error(`updateNodeStatus: source file missing on disk: ${absPath}`);
+  }
+  const rel = relative(vault, absPath);
+  if (rel.startsWith("..")) {
+    throw new Error(`updateNodeStatus: source file resolves outside the vault: ${absPath}`);
+  }
+
+  const raw = readFileSync(absPath, "utf8");
+  const parsed = parseDoc({ relPath, raw });
+
+  const previousRaw = parsed.frontmatter.status;
+  const previousStatus: TaskStatus | null = isTaskStatus(previousRaw) ? previousRaw : null;
+
+  const mutatedFrontmatter: Record<string, unknown> = {
+    ...parsed.frontmatter,
+    status: newStatus,
+  };
+  const rewritten = serializeDoc({ ...parsed, frontmatter: mutatedFrontmatter });
+
+  tracker?.markSelfWrite(absPath);
+  writeFileSync(absPath, rewritten, "utf8");
+
+  const reread = readFileSync(absPath, "utf8");
+  const reparsed = parseDoc({ relPath, raw: reread });
+  upsertDocNodeAndEdges(handle, relPath, reparsed);
+
+  return {
+    id: nodeId,
+    sourceFile: relPath,
+    absPath,
+    previousStatus,
+    newStatus,
+  };
+}
