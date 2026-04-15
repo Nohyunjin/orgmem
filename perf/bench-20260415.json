@@ -1,0 +1,67 @@
+{
+  "startedAt": "2026-04-15T03:53:40.225Z",
+  "host": {
+    "platform": "darwin",
+    "arch": "arm64",
+    "bun": "1.3.11"
+  },
+  "flags": {
+    "files": 1000,
+    "queries": 100,
+    "asks": 10,
+    "withRealEmbed": false,
+    "withRealAsk": false
+  },
+  "embeddingModel": "text-embedding-3-small",
+  "embeddingDim": 1536,
+  "targets": {
+    "askP50Ms": 3000,
+    "embed1000Ms": 120000,
+    "searchP50Ms": 200
+  },
+  "import": {
+    "wallMs": 511,
+    "nodes": 1000,
+    "edges": 4000,
+    "msPerFile": 0.51
+  },
+  "embed": {
+    "runs": [
+      {
+        "label": "stub",
+        "durationMs": 229.99,
+        "total": 1000,
+        "embedded": 1000,
+        "failed": 0
+      }
+    ]
+  },
+  "search": {
+    "n": 100,
+    "minMs": 0.92,
+    "p50Ms": 0.99,
+    "p95Ms": 1.45,
+    "p99Ms": 1.81,
+    "maxMs": 1.81,
+    "meanMs": 1.04,
+    "hitsPerQueryMean": 20
+  },
+  "ask": {
+    "live": false,
+    "note": "stub embed + stub answer — wall-clock excludes network/LLM latency",
+    "n": 10,
+    "minMs": 0.77,
+    "p50Ms": 0.85,
+    "p95Ms": 1.68,
+    "p99Ms": 1.68,
+    "maxMs": 1.68,
+    "meanMs": 0.92
+  },
+  "verdicts": {
+    "searchP50": "PASS",
+    "embed1000": "SKIP (no --with-real-embed)",
+    "askP50": "SKIP (no --with-real-ask)",
+    "embedStub1000Extrapolated": 229.99
+  },
+  "finishedAt": "2026-04-15T03:53:41.159Z"
+}
