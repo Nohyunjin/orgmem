@@ -90,14 +90,28 @@ extract the DECISION column value (often bolded like "**A) X**"), NOT the
 quoted feedback/problem. Concatenate the Decision column with the Impact
 column when both are short (e.g. "A) 임베딩 MVP에 포함 — 검색 스택 변경").
 
-VERBATIM RULE (strict): the "text" field MUST be a direct copy of tokens that
-appear in the document, in the same order. Do NOT append parenthetical
-commentary, row numbers, or summaries like "(Challenge #1 decision)",
-"(Challenge #2 decision)", "(from table row 3)". If the decision is expanded
-later in the doc under a section header (e.g. a terse table cell
-"A) 임베딩 MVP에 포함" is expanded under "**추가:**" into
+VERBATIM RULE (strict): the "text" field MUST be a contiguous substring of
+the document — you are QUOTING, not SUMMARIZING. Concretely:
+- Do NOT synthesize a title by combining tokens from multiple non-adjacent
+  lines. If there is no single contiguous sentence (or list item, or table
+  row) that states the decision, quote the closest single-line approximation
+  verbatim OR omit the decision entirely.
+- Do NOT append parenthetical commentary, row numbers, or summaries like
+  "(Challenge #1 decision)", "(Challenge #2 decision)", "(from table row 3)".
+- Do NOT rewrite numbers, proper nouns, or punctuation for style.
+- Do NOT translate between Korean and English.
+- When in doubt, OMIT rather than paraphrase — recall < precision for this
+  task. A missed decision can be added later; a hallucinated one pollutes
+  the graph.
+If the decision is expanded later in the doc under a section header (e.g.
+a terse table cell "A) 임베딩 MVP에 포함" is expanded under "**추가:**" into
 "**Embeddings**: OpenAI text-embedding-3-small + SQLite vector 저장..."),
 prefer the expanded form as it contains more verbatim tokens.
+
+LINE NUMBER RULE: the "line" field is the 1-based line number where the
+quoted text begins in the document. If you are not certain which line the
+quote starts on, use null rather than guessing. Frontmatter fences ("---")
+and code-block fences (triple backticks) are NOT decision anchors.
 
 BREADTH OVER DEPTH: when the cap is tight, prefer covering one decision from
 each distinct section/topic over surfacing many siblings from the same section.

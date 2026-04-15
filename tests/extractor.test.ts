@@ -96,7 +96,9 @@ describe("extractDecisionsFromDoc", () => {
         }),
       },
     ]);
-    const out = await extractDecisionsFromDoc(client, "sample doc", "body");
+    const body =
+      "Approach C: CHOSEN\n\nMVP에서 제외: GUI — 3개월 이후 고려.\n";
+    const out = await extractDecisionsFromDoc(client, "sample doc", body);
     expect(out.length).toBe(2);
     expect(out[0]!.text).toBe("Approach C: CHOSEN");
     expect(out[0]!.line).toBe(7);
@@ -113,6 +115,87 @@ describe("extractDecisionsFromDoc", () => {
       { match: "sample", text: "not json at all" },
     ]);
     await expect(extractDecisionsFromDoc(client, "sample", "body")).rejects.toThrow(/malformed/);
+  });
+
+  test("VERBATIM post-check drops paraphrases not contained in body (dogfood-4 fix)", async () => {
+    // Simulates Lane C dogfood (2026-04-15) issue (4): extractor synthesizes
+    // a title by combining tokens from non-adjacent lines. The synthesized
+    // string is not a contiguous substring of the body, so the post-check
+    // drops it. Verbatim items pass.
+    const body = [
+      "# Design",
+      "",
+      "AI 에이전트가 first-class 참여자인 지식+업무 그래프. Notion 킬러가 아닌 새 카테고리.",
+      "",
+      "## Decisions",
+      "",
+      "- Approach C: 에이전트 네이티브 워크스페이스 ← CHOSEN",
+      "- 에이전트 프로토콜: **MCP 표준 사용**.",
+    ].join("\n");
+
+    const client = createStubExtractorClient([
+      {
+        match: "# design",
+        text: JSON.stringify({
+          decisions: [
+            { text: "Approach C: 에이전트 네이티브 워크스페이스 ← CHOSEN", reasoning: "verbatim", line: 7 },
+            { text: "에이전트 프로토콜: MCP 표준 사용.", reasoning: "markdown bold stripped", line: 8 },
+            // synthesized paraphrase — tokens taken from line 3 + line 7
+            { text: "AI 에이전트 네이티브 워크스페이스 접근 선택 — Notion 킬러가 아닌 새 카테고리", reasoning: "synthesis", line: 3 },
+          ],
+        }),
+      },
+    ]);
+
+    const dropped: Array<{ text: string; reason: string }> = [];
+    const out = await extractDecisionsFromDoc(client, "design", body, {
+      onDropped: (d) => dropped.push(d),
+    });
+
+    expect(out.length).toBe(2);
+    expect(out[0]!.text).toBe("Approach C: 에이전트 네이티브 워크스페이스 ← CHOSEN");
+    expect(out[1]!.text).toBe("에이전트 프로토콜: MCP 표준 사용.");
+
+    expect(dropped.length).toBe(1);
+    expect(dropped[0]!.reason).toBe("not_a_substring_of_body");
+    expect(dropped[0]!.text.includes("AI 에이전트 네이티브 워크스페이스 접근 선택")).toBe(true);
+  });
+
+  test("VERBATIM post-check allows markdown-emphasis edits (bold, backticks)", async () => {
+    // The extractor often strips **bold** / `code-span` wrapping while
+    // quoting. Those are legitimate edits — `normalizeForVerbatim` ignores
+    // them on both sides of the substring check.
+    const body = "We decided: **graph.schema** is a fixed enum. `graph.query` is DEFERRED.";
+    const client = createStubExtractorClient([
+      {
+        match: "demo",
+        text: JSON.stringify({
+          decisions: [
+            { text: "graph.schema is a fixed enum.", reasoning: "strip bold", line: 1 },
+            { text: "graph.query is DEFERRED.", reasoning: "strip backticks", line: 1 },
+          ],
+        }),
+      },
+    ]);
+
+    const out = await extractDecisionsFromDoc(client, "demo", body);
+    expect(out.length).toBe(2);
+  });
+
+  test("verbatimCheck=false disables the post-check (testing-only escape hatch)", async () => {
+    const client = createStubExtractorClient([
+      {
+        match: "demo",
+        text: JSON.stringify({
+          decisions: [{ text: "completely invented text", reasoning: "r", line: 1 }],
+        }),
+      },
+    ]);
+
+    const out = await extractDecisionsFromDoc(client, "demo", "nothing matching here", {
+      verbatimCheck: false,
+    });
+    expect(out.length).toBe(1);
   });
 });
 
