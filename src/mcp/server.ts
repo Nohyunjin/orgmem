@@ -6,6 +6,9 @@ import { registerSearch } from "./tools/search.ts";
 import { registerGetNode } from "./tools/get_node.ts";
 import { registerListEdgesFromFile } from "./tools/list_edges.ts";
 import { registerStatus } from "./tools/status.ts";
+import { registerDocAppend } from "./tools/append.ts";
+import { registerTaskUpdateStatus } from "./tools/update_status.ts";
+import { registerDecisionsExtract } from "./tools/decisions_extract.ts";
 
 const SERVER_INFO = {
   name: "orgmem",
@@ -28,5 +31,8 @@ export function buildMcpServer(ctx: McpContext): McpServer {
   registerGetNode(server, ctx);
   registerListEdgesFromFile(server, ctx);
   registerStatus(server, ctx);
+  registerDocAppend(server, ctx);
+  registerTaskUpdateStatus(server, ctx);
+  registerDecisionsExtract(server, ctx);
   return server;
 }

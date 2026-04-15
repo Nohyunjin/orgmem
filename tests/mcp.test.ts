@@ -52,7 +52,7 @@ describe("mcp server smoke", () => {
     rmSync(ws.dir, { recursive: true, force: true });
   });
 
-  test("initialize + tools/list exposes all 6 tools", async () => {
+  test("initialize + tools/list exposes all 9 tools", async () => {
     const { tools } = await ws.client.listTools();
     const names = tools.map((t) => t.name).sort();
     expect(names).toEqual(
@@ -63,6 +63,9 @@ describe("mcp server smoke", () => {
         "kg_list_edges_from_file",
         "kg_search",
         "kg_status",
+        "doc_append",
+        "task_update_status",
+        "decisions_extract",
       ].sort(),
     );
   });
@@ -160,6 +163,100 @@ describe("mcp server smoke", () => {
     expect(res.isError).toBe(true);
     const payload = parseToolJson(res);
     expect(payload.error).toMatch(/no OPENAI_API_KEY/i);
+  });
+
+  test("doc_append appends to body + reindexes (embedding flips back to pending)", async () => {
+    const created = parseToolJson(
+      (await ws.client.callTool({
+        name: "kg_create_node",
+        arguments: { type: "Meeting", title: "Standup", date: "2026-04-15" },
+      })) as any,
+    );
+    const appendRes = parseToolJson(
+      (await ws.client.callTool({
+        name: "doc_append",
+        arguments: { nodeId: created.id, content: "- Follow-up: ship MCP" },
+      })) as any,
+    );
+    expect(appendRes.id).toBe(created.id);
+    expect(appendRes.appendedChars).toBe("- Follow-up: ship MCP".length);
+    const raw = readFileSync(appendRes.absPath, "utf8");
+    expect(raw).toContain("- Follow-up: ship MCP");
+  });
+
+  test("doc_append rejects empty content + missing node", async () => {
+    const empty = (await ws.client.callTool({
+      name: "doc_append",
+      arguments: { nodeId: "anything", content: "   \n  " },
+    })) as any;
+    expect(empty.isError).toBe(true);
+    const missing = (await ws.client.callTool({
+      name: "doc_append",
+      arguments: { nodeId: "does-not-exist", content: "valid body" },
+    })) as any;
+    expect(missing.isError).toBe(true);
+    const missingPayload = parseToolJson(missing);
+    expect(missingPayload.error).toMatch(/does not exist/);
+  });
+
+  test("task_update_status flips a Task's status + persists to frontmatter", async () => {
+    const task = parseToolJson(
+      (await ws.client.callTool({
+        name: "kg_create_node",
+        arguments: { type: "Task", title: "Wire MCP" },
+      })) as any,
+    );
+    const upd = parseToolJson(
+      (await ws.client.callTool({
+        name: "task_update_status",
+        arguments: { nodeId: task.id, status: "in_progress" },
+      })) as any,
+    );
+    expect(upd.newStatus).toBe("in_progress");
+    expect(upd.id).toBe(task.id);
+    const raw = readFileSync(task.absPath, "utf8");
+    expect(raw).toMatch(/status:\s*in_progress/);
+  });
+
+  test("task_update_status rejects non-Task nodes + invalid statuses", async () => {
+    const decision = parseToolJson(
+      (await ws.client.callTool({
+        name: "kg_create_node",
+        arguments: { type: "Decision", title: "Pick stack", date: "2026-04-15" },
+      })) as any,
+    );
+    const wrongType = (await ws.client.callTool({
+      name: "task_update_status",
+      arguments: { nodeId: decision.id, status: "done" },
+    })) as any;
+    expect(wrongType.isError).toBe(true);
+    expect(parseToolJson(wrongType).error).toMatch(/only Task nodes/);
+
+    // invalid enum is caught by SDK validator before we even hit the handler
+    const invalidStatus = await ws.client
+      .callTool({
+        name: "task_update_status",
+        arguments: { nodeId: decision.id, status: "wat" },
+      })
+      .catch((err: Error) => ({ thrown: err.message }));
+    if ("thrown" in (invalidStatus as any)) {
+      expect((invalidStatus as any).thrown).toMatch(/invalid|enum|wat/i);
+    } else {
+      expect((invalidStatus as any).isError).toBe(true);
+    }
+  });
+
+  test("decisions_extract returns stub payload (echoes inputs, signals not-wired)", async () => {
+    const res = parseToolJson(
+      (await ws.client.callTool({
+        name: "decisions_extract",
+        arguments: { nodeId: "doc-some-source", dryRun: true },
+      })) as any,
+    );
+    expect(res.stub).toBe(true);
+    expect(res.received.nodeId).toBe("doc-some-source");
+    expect(res.received.dryRun).toBe(true);
+    expect(res.message).toMatch(/not wired|week 3|Lane C/i);
   });
 
   test("invalid input is rejected with a tool error", async () => {

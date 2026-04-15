@@ -85,7 +85,7 @@ describe("mcp e2e (real stdio child process)", () => {
     expect(ctx.stderrBuf).toContain(`vault=${ctx.vault}`);
   });
 
-  test("2. tools/list exposes kg_create_node and the other 5 tools", async () => {
+  test("2. tools/list exposes all 9 tools", async () => {
     const { tools } = await ctx.client.listTools();
     const names = new Set(tools.map((t) => t.name));
     for (const required of [
@@ -95,6 +95,9 @@ describe("mcp e2e (real stdio child process)", () => {
       "kg_list_edges_from_file",
       "kg_search",
       "kg_status",
+      "doc_append",
+      "task_update_status",
+      "decisions_extract",
     ]) {
       expect(names.has(required)).toBe(true);
     }
