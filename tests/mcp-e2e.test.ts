@@ -588,3 +588,136 @@ describe("mcp e2e — decisions_extract dedup (Lane C fix #2 verification)", () 
     expect(status.edges).toBe(N);
   });
 });
+
+/**
+ * Verifies Lane C's VERBATIM post-check (commit 7690511 — issue #4) at the
+ * MCP level. The stub returns a mix of verbatim and paraphrased decisions;
+ * the latter must be dropped by `extractDecisionsFromDoc`'s substring-of-body
+ * guard and surfaced on the MCP response's `dropped` field — they must NOT
+ * materialize as Decision nodes.
+ */
+describe("mcp e2e — decisions_extract VERBATIM check (Lane C fix #4 verification)", () => {
+  const VERBATIM_A = "Adopt Postgres as the primary OLTP store";
+  const VERBATIM_B = "Ship the new auth flow in week 3";
+  // A paraphrase that combines tokens from the doc body but does NOT appear
+  // as a contiguous substring anywhere. Pre-fix this would have materialized
+  // as a Decision node; post-fix it must be dropped.
+  const PARAPHRASE = "Migrate to Postgres and ship auth in the same quarter";
+
+  let dir: string;
+  let vault: string;
+  let client: Client;
+  let transport: StdioClientTransport;
+
+  beforeAll(async () => {
+    dir = mkdtempSync(resolve(tmpdir(), "orgmem-e2e-verbatim-"));
+    vault = join(dir, "vault");
+    const db = join(dir, "dev.db");
+    const stubPath = join(dir, "extractor-stub.json");
+    const fs = await import("node:fs");
+    fs.mkdirSync(vault, { recursive: true });
+
+    const stubText = JSON.stringify({
+      decisions: [
+        { text: VERBATIM_A, reasoning: "Stub: verbatim #1", line: 4 },
+        { text: PARAPHRASE, reasoning: "Stub: paraphrase that must drop", line: 5 },
+        { text: VERBATIM_B, reasoning: "Stub: verbatim #2", line: 6 },
+      ],
+    });
+
+    writeFileSync(
+      stubPath,
+      JSON.stringify({ mode: "sequence", responses: [stubText, stubText] }),
+      "utf8",
+    );
+
+    const repoRoot = resolve(import.meta.dir, "..");
+    transport = new StdioClientTransport({
+      command: process.execPath,
+      args: ["src/cli/kg.ts", "mcp"],
+      cwd: repoRoot,
+      env: {
+        PATH: process.env.PATH ?? "",
+        HOME: process.env.HOME ?? "",
+        ORGMEM_VAULT: vault,
+        ORGMEM_DB: db,
+        ORGMEM_EXTRACTOR_STUB: stubPath,
+      },
+      stderr: "pipe",
+    });
+    client = new Client({ name: "orgmem-e2e-verbatim", version: "0.0.0" }, { capabilities: {} });
+    await client.connect(transport);
+  });
+
+  afterAll(async () => {
+    if (client) await client.close().catch(() => {});
+    if (dir) rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("paraphrased decision is dropped (dryRun surfaces it in dropped[])", async () => {
+    // Body contains VERBATIM_A and VERBATIM_B as standalone lines.
+    // PARAPHRASE does NOT appear as a contiguous substring.
+    const meeting = await callTool(client, "kg_create_node", {
+      type: "Meeting",
+      title: "Infra planning",
+      content:
+        [
+          "# Infra planning",
+          "",
+          "Agenda:",
+          "- Storage",
+          `- ${VERBATIM_A}`,
+          `- ${VERBATIM_B}`,
+          "- Migration roadmap discussed separately",
+        ].join("\n") + "\n",
+      date: "2026-04-15",
+    });
+
+    const res = await callTool(client, "decisions_extract", {
+      nodeId: meeting.id,
+      dryRun: true,
+    });
+
+    // Only the 2 verbatim items survive; the paraphrase is filtered out.
+    expect(res.extractedCount).toBe(2);
+    expect(res.extracted.length).toBe(2);
+    const kept = res.extracted.map((e: { text: string }) => e.text).sort();
+    expect(kept).toEqual([VERBATIM_A, VERBATIM_B].sort());
+
+    // The paraphrase shows up on dropped[] with the expected reason.
+    expect(res.dropped.length).toBe(1);
+    expect(res.dropped[0].text).toBe(PARAPHRASE);
+    expect(res.dropped[0].reason).toBe("not_a_substring_of_body");
+  });
+
+  test("write call: only verbatim decisions materialize; paraphrase never hits the graph", async () => {
+    const sourceDocId = "meeting-2026-04-15-infra-planning";
+    const statusBefore = await callTool(client, "kg_status", {});
+
+    const res = await callTool(client, "decisions_extract", {
+      nodeId: sourceDocId,
+      dryRun: false,
+      date: "2026-04-15",
+    });
+
+    expect(res.extractedCount).toBe(2);
+    expect(res.created.length).toBe(2);
+    expect(res.errors.length).toBe(0);
+
+    // dropped[] still reports the paraphrase on the write path.
+    expect(res.dropped.length).toBe(1);
+    expect(res.dropped[0].reason).toBe("not_a_substring_of_body");
+    expect(res.dropped[0].text).toBe(PARAPHRASE);
+
+    // On-disk proof: no Decision file contains the paraphrase text anywhere.
+    for (const d of res.created as Array<{ mdPath: string }>) {
+      const raw = readFileSync(join(vault, d.mdPath), "utf8");
+      expect(raw).not.toContain(PARAPHRASE);
+    }
+
+    // Graph state: Meeting + 2 Decisions = +2 nodes, +2 decided_in edges.
+    const statusAfter = await callTool(client, "kg_status", {});
+    expect(statusAfter.nodes - statusBefore.nodes).toBe(2);
+    expect(statusAfter.edges - statusBefore.edges).toBe(2);
+  });
+});

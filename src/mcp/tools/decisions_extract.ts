@@ -6,6 +6,7 @@ import {
   extractDecisionsFromDoc,
   materializeDecisions,
   DEFAULT_EXTRACTOR_MODEL,
+  type VerbatimDropped,
 } from "../../extractor/index.ts";
 import type { McpContext } from "../context.ts";
 import { ok, fail } from "./result.ts";
@@ -90,7 +91,10 @@ export function registerDecisionsExtract(server: McpServer, ctx: McpContext): vo
 
         const body = readFileSync(absPath, "utf8");
         const title = row.title ?? row.id;
-        const extracted = await extractDecisionsFromDoc(ctx.extractorClient, title, body);
+        const dropped: VerbatimDropped[] = [];
+        const extracted = await extractDecisionsFromDoc(ctx.extractorClient, title, body, {
+          onDropped: (d) => dropped.push(d),
+        });
 
         const dryRun = args.dryRun ?? false;
         if (dryRun) {
@@ -101,6 +105,7 @@ export function registerDecisionsExtract(server: McpServer, ctx: McpContext): vo
             dryRun: true,
             extractedCount: extracted.length,
             extracted,
+            dropped,
           });
         }
 
@@ -116,6 +121,7 @@ export function registerDecisionsExtract(server: McpServer, ctx: McpContext): vo
           created: report.created,
           skipped: report.skipped,
           errors: report.errors,
+          dropped,
           wallMs: report.wallMs,
         });
       } catch (err) {
