@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 import { resolve } from "node:path";
 import { existsSync } from "node:fs";
+import pkg from "../../package.json" with { type: "json" };
 import { openDb, defaultDbPath } from "../storage/sqlite.ts";
 import { runMigrations } from "../storage/migrate.ts";
 import { importVault } from "../vault/import.ts";
@@ -62,7 +63,7 @@ async function main(): Promise<void> {
     return;
   }
   if (cmd === "--version" || cmd === "-v") {
-    process.stdout.write("kg 0.1.0 (orgmem Phase 1)\n");
+    process.stdout.write(`kg ${pkg.version} (orgmem Phase 1)\n`);
     return;
   }
 

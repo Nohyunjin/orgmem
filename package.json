@@ -1,6 +1,6 @@
 {
   "name": "orgmem",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "description": "Agent-native knowledge & work graph. Markdown vault becomes a SQLite graph (nodes + deterministic edges) with sqlite-vec embedding search, exposed to agents over MCP.",
   "keywords": [
     "mcp",
@@ -38,8 +38,9 @@
   ],
   "scripts": {
     "kg": "bun src/cli/kg.ts",
-    "db:generate": "drizzle-kit generate",
+    "db:generate": "drizzle-kit generate && bun scripts/gen-migrations-manifest.ts",
     "db:migrate": "bun src/storage/migrate.ts",
+    "gen:bundle": "bun scripts/gen-migrations-manifest.ts && bun scripts/gen-sqlite-vec-native.ts",
     "test": "bun test",
     "typecheck": "tsc --noEmit",
     "postinstall": "node scripts/postinstall.mjs",

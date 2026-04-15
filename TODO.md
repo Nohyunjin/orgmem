@@ -6,18 +6,6 @@ commit SHA when shipped.
 
 ## Week 6 — distribution
 
-- [ ] **`kg --version` string hardcoded.** `src/cli/kg.ts:46` prints
-  `"kg 0.1.0 (orgmem Phase 1)"` regardless of the installed package
-  version, so after `brew upgrade orgmem` (0.1.0 → 0.1.1) the CLI
-  still reports 0.1.0. Sync from `package.json` in the next release:
-    - Option A: `import pkg from "../../package.json" with { type: "json" }`
-      and format `` `kg ${pkg.version} (orgmem Phase 1)` ``. Works in
-      dev (`bun src/cli/kg.ts`) and in bun-compile (bun bundles the
-      JSON via the import-attribute).
-    - Option B: `bun build --define KG_VERSION='"0.1.1"' …` in
-      release.yml so the compiled binary gets the right literal.
-  Deferred to v0.1.2 / v0.2 — current mismatch is cosmetic.
-
 - [ ] **macOS Developer ID notarization for the bun-compile binary.**
   v0.1.1 ships ad-hoc codesigned binaries (DONE — release.yml step
   `codesign --remove-signature && codesign --force --sign -`). That

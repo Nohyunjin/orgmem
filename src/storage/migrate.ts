@@ -1,9 +1,6 @@
-import { readdirSync, readFileSync } from "node:fs";
-import { resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { openDb, defaultDbPath, type DbHandle } from "./sqlite.ts";
-
-const MIGRATIONS_DIR = resolve(import.meta.dir, "migrations");
+import { MIGRATIONS } from "./migrations.generated.ts";
 
 interface MigrationFile {
   name: string; // filename stem, e.g. '0000_lucky_kinsey_walden'
@@ -11,14 +8,28 @@ interface MigrationFile {
   checksum: string;
 }
 
+/**
+ * Migrations are bundled into the binary at compile time via the
+ * generated manifest (`src/storage/migrations.generated.ts`). We do NOT
+ * walk the filesystem at runtime — `bun build --compile` does not
+ * auto-bundle files only accessed via `readdirSync`, which is what
+ * broke v0.1.1's `kg init` (`ENOENT: scandir '/$bunfs/root/migrations'`).
+ *
+ * The manifest carries a build-time checksum; we recompute the runtime
+ * checksum here as a tamper-detect (any byte difference between what
+ * the generator saw and what the binary carries surfaces as a mismatch
+ * before we touch the DB).
+ */
 function discoverMigrations(): MigrationFile[] {
-  const entries = readdirSync(MIGRATIONS_DIR)
-    .filter((f) => f.endsWith(".sql"))
-    .sort();
-  return entries.map((f) => {
-    const sql = readFileSync(resolve(MIGRATIONS_DIR, f), "utf8");
-    const checksum = createHash("sha256").update(sql).digest("hex");
-    return { name: f.replace(/\.sql$/, ""), sql, checksum };
+  return MIGRATIONS.map((m) => {
+    const checksum = createHash("sha256").update(m.sql, "utf8").digest("hex");
+    if (checksum !== m.checksum) {
+      throw new Error(
+        `migration manifest checksum drift for ${m.name}: ` +
+          `runtime ${checksum} vs build-time ${m.checksum}`,
+      );
+    }
+    return { name: m.name, sql: m.sql, checksum };
   });
 }
 

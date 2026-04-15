@@ -1,10 +1,16 @@
 import { Database } from "bun:sqlite";
 import { drizzle, type BunSQLiteDatabase } from "drizzle-orm/bun-sqlite";
-import { existsSync, mkdirSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, resolve, join } from "node:path";
+import { homedir } from "node:os";
 import * as sqliteVec from "sqlite-vec";
 import * as schema from "./schema.ts";
 import { EMBEDDING_DIM } from "../embeddings/model.ts";
+import {
+  BUNDLED_VEC_PATH,
+  VEC_LIB_FILENAME,
+  VEC_BUNDLED_SHA256,
+} from "./sqlite-vec-native.generated.ts";
 
 export interface OpenOptions {
   /** Absolute DB path. */
@@ -38,6 +44,34 @@ const CANDIDATE_SQLITE_PATHS = [
   "/usr/lib/aarch64-linux-gnu/libsqlite3.so.0",
   "/usr/lib/libsqlite3.so.0",
 ].filter((p): p is string => typeof p === "string" && p.length > 0);
+
+/**
+ * When running inside a `bun build --compile` binary, BUNDLED_VEC_PATH
+ * resolves to a /$bunfs/root/... virtual path that dlopen() can't open.
+ * Extract those bytes to a real filesystem cache (`$ORGMEM_CACHE_DIR` or
+ * `~/.cache/orgmem/sqlite-vec/`) on first use, then return that real
+ * path. Cache key includes the build-time sha256 so a future binary with
+ * a different vec0 lib auto-extracts a fresh copy without colliding.
+ *
+ * Returns null in dev/test mode (the committed stub leaves
+ * BUNDLED_VEC_PATH unset); callers fall back to sqliteVec.load() in
+ * that case.
+ */
+function ensureBundledVecExtracted(): string | null {
+  if (!BUNDLED_VEC_PATH || !VEC_LIB_FILENAME || !VEC_BUNDLED_SHA256) {
+    return null;
+  }
+  const cacheDir =
+    process.env.ORGMEM_CACHE_DIR ?? join(homedir(), ".cache", "orgmem", "sqlite-vec");
+  mkdirSync(cacheDir, { recursive: true });
+  // Suffix the cached file with a short sha so a binary upgrade transparently
+  // extracts a fresh copy instead of trying to mmap a stale one.
+  const dest = join(cacheDir, `${VEC_LIB_FILENAME}-${VEC_BUNDLED_SHA256.slice(0, 16)}`);
+  if (existsSync(dest)) return dest;
+  const bytes = readFileSync(BUNDLED_VEC_PATH);
+  writeFileSync(dest, bytes);
+  return dest;
+}
 
 function applyCustomSqlite(): { ok: boolean; path?: string; error?: string } {
   if (customSqliteApplied) return { ok: true };
@@ -88,7 +122,18 @@ export function openDb(opts: OpenOptions): DbHandle {
 
   if (wantVec && !vecError) {
     try {
-      sqliteVec.load(raw);
+      const bundled = ensureBundledVecExtracted();
+      if (bundled) {
+        // Compiled-binary path: bun build --compile bundles the .dylib/.so
+        // as an asset, but dlopen() needs a real filesystem path. We
+        // extract the bundled bytes to ~/.cache/orgmem/sqlite-vec/ once
+        // and reuse on subsequent runs.
+        raw.loadExtension(bundled);
+      } else {
+        // Dev / test mode: sqlite-vec's package exports the resolver
+        // we want, walking node_modules to find the matching native dep.
+        sqliteVec.load(raw);
+      }
       vecLoaded = true;
     } catch (err) {
       vecError = (err as Error).message;

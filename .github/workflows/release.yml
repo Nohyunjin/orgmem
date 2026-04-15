@@ -39,12 +39,25 @@ jobs:
       - name: Install deps (frozen lockfile)
         run: bun install --frozen-lockfile
 
+      # Regenerate the build-time manifests so the compiled binary
+      # carries (a) every migration as a bundled text-import and (b)
+      # the host platform's sqlite-vec native library as a bundled
+      # asset. Both files live at src/storage/*.generated.ts; the
+      # committed versions are stubs / dev-platform-specific, and CI
+      # MUST regenerate before bun --compile or the binary will crash
+      # at first `kg init` (missing migrations) or `kg embed`
+      # (missing vec0 native lib).
+      - name: Regenerate bundle manifests
+        run: |
+          bun scripts/gen-migrations-manifest.ts
+          bun scripts/gen-sqlite-vec-native.ts
+
       # bun build --compile produces a single-file executable with the
       # Bun runtime embedded. The resulting binary still loads the host's
       # system libsqlite3 at runtime (via sqlite-vec's Database.setCustomSQLite),
       # so end users still need `brew install sqlite` / `apt install libsqlite3-dev`.
       # We do NOT need system SQLite at build time — the compile step only
-      # bundles JS + TS sources.
+      # bundles JS + TS sources + the assets pulled in by the manifests above.
       - name: Compile kg binary
         run: |
           mkdir -p dist
@@ -75,13 +88,29 @@ jobs:
           codesign --force --sign - dist/kg-${{ matrix.target.name }}
           codesign --verify --verbose dist/kg-${{ matrix.target.name }}
 
-      # Smoke test runs natively on the matching runner (macos-latest is
-      # arm64, ubuntu-latest is x64). --version path writes a fixed string
-      # and returns — no DB open, no sqlite dependency. If the binary is
-      # broken at a fundamental level (missing symbols, wrong arch), this
-      # fails loud.
-      - name: Smoke test --version
-        run: dist/kg-${{ matrix.target.name }} --version
+      # Smoke tests run natively on the matching runner (macos-latest is
+      # arm64, ubuntu-latest is x64). --version checks that the binary
+      # boots at all; doctor exercises the bundle extraction path
+      # (migrations.generated.ts + sqlite-vec-native.generated.ts),
+      # catches regressions where the bundled assets stop reaching the
+      # /$bunfs filesystem.
+      - name: System SQLite for smoke (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libsqlite3-0 libsqlite3-dev
+      - name: System SQLite for smoke (macOS)
+        if: runner.os == 'macOS'
+        run: brew install sqlite
+      - name: Smoke test --version + doctor
+        env:
+          # Use a fresh tmp DB so doctor hits the in-memory pre-init
+          # vec probe path (the one most likely to regress on a
+          # bundle-extraction bug).
+          ORGMEM_DB: ${{ runner.temp }}/orgmem-smoke.db
+        run: |
+          dist/kg-${{ matrix.target.name }} --version
+          dist/kg-${{ matrix.target.name }} doctor | tee /tmp/doctor.json
+          # Fail loud if vec didn't load — the entire point of v0.1.2.
+          grep -q '"vecLoaded": true' /tmp/doctor.json
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
