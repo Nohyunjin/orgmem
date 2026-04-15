@@ -6,24 +6,31 @@ commit SHA when shipped.
 
 ## Week 6 — distribution
 
-- [ ] **macOS code-signing for the bun-compile binary.** Surfaced during
-  v0.1.0 release: the unsigned darwin-arm64 binary published by
-  release.yml is killed by macOS at launch (`exit 137 / SIGKILL`,
-  `codesign -dv` reports "code object is not signed at all"). The
-  in-CI smoke test inside release.yml passes because GitHub's macOS
-  runner has a more permissive policy than a typical user machine.
-  Fixes, in order of effort:
-    1. Cheap: add `codesign --sign - --force --timestamp dist/kg-darwin-arm64`
-       step to release.yml after the bun-compile step. Ad-hoc signature
-       satisfies macOS's "must be signed" rule but does NOT clear
-       Gatekeeper for downloaded binaries.
-    2. Medium: post-install instruction for users to run
-       `codesign --sign - --force /opt/homebrew/bin/kg` themselves.
-    3. Proper: enroll an Apple Developer ID, sign + notarize per
-       release. Requires paid account + secret management in
-       release.yml. Right answer long-term.
-  Linux binary is unaffected. Until fix lands, document the
-  workaround in the brew install section of README.
+- [ ] **`kg --version` string hardcoded.** `src/cli/kg.ts:46` prints
+  `"kg 0.1.0 (orgmem Phase 1)"` regardless of the installed package
+  version, so after `brew upgrade orgmem` (0.1.0 → 0.1.1) the CLI
+  still reports 0.1.0. Sync from `package.json` in the next release:
+    - Option A: `import pkg from "../../package.json" with { type: "json" }`
+      and format `` `kg ${pkg.version} (orgmem Phase 1)` ``. Works in
+      dev (`bun src/cli/kg.ts`) and in bun-compile (bun bundles the
+      JSON via the import-attribute).
+    - Option B: `bun build --define KG_VERSION='"0.1.1"' …` in
+      release.yml so the compiled binary gets the right literal.
+  Deferred to v0.1.2 / v0.2 — current mismatch is cosmetic.
+
+- [ ] **macOS Developer ID notarization for the bun-compile binary.**
+  v0.1.1 ships ad-hoc codesigned binaries (DONE — release.yml step
+  `codesign --remove-signature && codesign --force --sign -`). That
+  cleared the SIGKILL at launch, but Gatekeeper still flags
+  downloaded unsigned binaries in some contexts (right-click-open
+  dialogs, enterprise-managed machines). v0.2 should upgrade to
+  proper Developer ID + notarization:
+    - Enroll paid Apple Developer account
+    - Store signing certificate + app-specific password as repo secrets
+    - release.yml: `codesign --sign "Developer ID Application: …"` +
+      `xcrun notarytool submit --wait` + `xcrun stapler staple`
+  Until then README's "First run on macOS" section documents the
+  ad-hoc + quarantine fallback.
 
 - [ ] **sqlite-vec system dependency onboarding.** Currently vec load requires
   a separately-installed system SQLite with loadable extensions
