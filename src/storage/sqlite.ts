@@ -62,8 +62,13 @@ function applyCustomSqlite(): { ok: boolean; path?: string; error?: string } {
  * `vecLoaded` before relying on it).
  */
 export function openDb(opts: OpenOptions): DbHandle {
-  const abs = resolve(opts.path);
-  mkdirSync(dirname(abs), { recursive: true });
+  // `:memory:` is a well-known bun:sqlite alias for an ephemeral DB. We
+  // must not resolve() it (would turn it into `<cwd>/:memory:`) or mkdir
+  // its "directory". The postinstall probe and kg doctor pre-init check
+  // rely on this path.
+  const isMemory = opts.path === ":memory:";
+  const abs = isMemory ? ":memory:" : resolve(opts.path);
+  if (!isMemory) mkdirSync(dirname(abs), { recursive: true });
 
   let vecLoaded = false;
   let vecError: string | undefined;

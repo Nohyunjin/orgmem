@@ -32,6 +32,7 @@
   },
   "files": [
     "src",
+    "scripts/postinstall.mjs",
     "LICENSE",
     "README.md"
   ],
@@ -41,6 +42,7 @@
     "db:migrate": "bun src/storage/migrate.ts",
     "test": "bun test",
     "typecheck": "tsc --noEmit",
+    "postinstall": "node scripts/postinstall.mjs",
     "prepublishOnly": "bun test && bunx tsc --noEmit"
   },
   "engines": {

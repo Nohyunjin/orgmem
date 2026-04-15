@@ -415,9 +415,24 @@ async function main(): Promise<void> {
       out.vault = { path: null, source: null, exists: null };
     }
 
-    // Everything below this point needs the DB open. If the DB file doesn't
-    // exist yet, return a shallow report with a clear hint to run `kg init`.
+    // If the DB file doesn't exist yet, do an ephemeral in-memory vec probe
+    // so the operator (and the npm postinstall hook) can diagnose
+    // loadable-extension issues before ever running `kg init`. No files
+    // land on disk from this path.
     if (!dbExists) {
+      const probe = openDb({ path: ":memory:", loadVec: true });
+      try {
+        out.vecLoaded = probe.vecLoaded;
+        out.vecError = probe.vecError ?? null;
+        if (probe.vecLoaded) {
+          const row = probe.raw.prepare("SELECT vec_version() AS v;").get() as {
+            v: string;
+          };
+          out.vecVersion = row.v;
+        }
+      } finally {
+        probe.raw.close();
+      }
       out.hint = "run `kg init` to create the DB and apply migrations";
       process.stdout.write(JSON.stringify(out, null, 2) + "\n");
       return;
