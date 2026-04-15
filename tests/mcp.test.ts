@@ -8,6 +8,10 @@ import { openDb, type DbHandle } from "../src/storage/sqlite.ts";
 import { runMigrations } from "../src/storage/migrate.ts";
 import { buildMcpServer } from "../src/mcp/server.ts";
 import type { McpContext } from "../src/mcp/context.ts";
+import {
+  createStubExtractorClient,
+  type ExtractorClient,
+} from "../src/extractor/index.ts";
 
 interface Workspace {
   dir: string;
@@ -17,14 +21,18 @@ interface Workspace {
   client: Client;
 }
 
-async function mkWorkspace(): Promise<Workspace> {
+async function mkWorkspace(opts: { extractorClient?: ExtractorClient } = {}): Promise<Workspace> {
   const dir = mkdtempSync(resolve(tmpdir(), "orgmem-mcp-"));
   const vault = join(dir, "vault");
   const db = join(dir, "dev.db");
   mkdirSync(vault, { recursive: true });
   runMigrations(db, { loadVec: false });
   const handle = openDb({ path: db, loadVec: false });
-  const ctx: McpContext = { handle, vaultPath: vault };
+  const ctx: McpContext = {
+    handle,
+    vaultPath: vault,
+    extractorClient: opts.extractorClient,
+  };
   const server = buildMcpServer(ctx);
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   await server.connect(serverTransport);
@@ -246,17 +254,44 @@ describe("mcp server smoke", () => {
     }
   });
 
-  test("decisions_extract returns stub payload (echoes inputs, signals not-wired)", async () => {
-    const res = parseToolJson(
+  test("decisions_extract without extractorClient returns 'not configured' error", async () => {
+    const res = (await ws.client.callTool({
+      name: "decisions_extract",
+      arguments: { nodeId: "doc-some-source", dryRun: true },
+    })) as any;
+    expect(res.isError).toBe(true);
+    expect(parseToolJson(res).error).toMatch(/no ANTHROPIC_API_KEY|ORGMEM_EXTRACTOR_STUB/i);
+  });
+
+  test("decisions_extract rejects nonexistent + wrong-type source nodes", async () => {
+    const stub = createStubExtractorClient([
+      { match: "anything", text: '{"decisions":[]}' },
+    ]);
+    await ws.client.close();
+    ws.handle.raw.close();
+    rmSync(ws.dir, { recursive: true, force: true });
+    ws = await mkWorkspace({ extractorClient: stub });
+
+    const missing = (await ws.client.callTool({
+      name: "decisions_extract",
+      arguments: { nodeId: "no-such-source", dryRun: true },
+    })) as any;
+    expect(missing.isError).toBe(true);
+    expect(parseToolJson(missing).error).toMatch(/does not exist/);
+
+    // Decision node — wrong type for extraction source.
+    const decision = parseToolJson(
       (await ws.client.callTool({
-        name: "decisions_extract",
-        arguments: { nodeId: "doc-some-source", dryRun: true },
+        name: "kg_create_node",
+        arguments: { type: "Decision", title: "x", date: "2026-04-15" },
       })) as any,
     );
-    expect(res.stub).toBe(true);
-    expect(res.received.nodeId).toBe("doc-some-source");
-    expect(res.received.dryRun).toBe(true);
-    expect(res.message).toMatch(/not wired|week 3|Lane C/i);
+    const wrongType = (await ws.client.callTool({
+      name: "decisions_extract",
+      arguments: { nodeId: decision.id, dryRun: true },
+    })) as any;
+    expect(wrongType.isError).toBe(true);
+    expect(parseToolJson(wrongType).error).toMatch(/only Document and Meeting/);
   });
 
   test("invalid input is rejected with a tool error", async () => {

@@ -30,9 +30,6 @@ commit SHA when shipped.
 - [ ] **Body-anchored Decision edges.** `createEdge` rejects non-zero sourceLine
   (write.ts:308). Decision `source_line` is parked on frontmatter as metadata
   for now. Promote to a real edge attribute once body-anchored edges ship.
-- [ ] **Wire `decisions_extract` MCP tool.** Stub at `src/mcp/tools/decisions_extract.ts`
-  should call `extractDecisionsFromDoc` + `materializeDecisions` from
-  `src/extractor/index.ts`. Lane B owns this wiring.
 
 - [ ] FS watcher: wire `lastSelfWriteAt[path]` 2s suppression map between
   engine writes and the chokidar event handler (scaffold lives in

@@ -2,6 +2,7 @@ import { resolve } from "node:path";
 import { existsSync } from "node:fs";
 import type { DbHandle } from "../storage/sqlite.ts";
 import type { EmbedClient } from "../embeddings/client.ts";
+import type { ExtractorClient } from "../extractor/index.ts";
 
 /**
  * Shared per-process state passed into every MCP tool handler. The server
@@ -14,6 +15,8 @@ export interface McpContext {
   vaultPath: string;
   /** Optional embed client — required by kg_search, absent disables it. */
   embedClient?: EmbedClient;
+  /** Optional extractor client — required by decisions_extract, absent disables it. */
+  extractorClient?: ExtractorClient;
 }
 
 /**

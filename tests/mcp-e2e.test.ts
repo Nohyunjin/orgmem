@@ -1,5 +1,5 @@
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
-import { mkdtempSync, rmSync, existsSync, readFileSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { resolve, join } from "node:path";
 import { tmpdir } from "node:os";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -272,5 +272,151 @@ describe("mcp e2e (real stdio child process)", () => {
     } else {
       expect(invalidStatus.isError).toBe(true);
     }
+  });
+});
+
+/**
+ * Separate describe — spawns a fresh server with ORGMEM_EXTRACTOR_STUB so
+ * decisions_extract has an extractor client wired (no Anthropic key needed).
+ */
+describe("mcp e2e — decisions_extract (stub-injected)", () => {
+  const SOURCE_TITLE = "Payment redesign meeting";
+  const STUB_MATCH = "We will adopt MCP for agent integration";
+  const STUB_DECISION_TEXT = "Adopt MCP as the primary agent integration surface";
+  const STUB_REASONING = "Stub: locked in during the meeting body";
+
+  let dir: string;
+  let vault: string;
+  let stubPath: string;
+  let client: Client;
+  let transport: StdioClientTransport;
+  let stderrBuf = "";
+
+  beforeAll(async () => {
+    dir = mkdtempSync(resolve(tmpdir(), "orgmem-e2e-extract-"));
+    vault = join(dir, "vault");
+    const db = join(dir, "dev.db");
+    stubPath = join(dir, "extractor-stub.json");
+    const fs = await import("node:fs");
+    fs.mkdirSync(vault, { recursive: true });
+
+    const stubResponses = [
+      {
+        match: STUB_MATCH,
+        text: JSON.stringify({
+          decisions: [
+            {
+              text: STUB_DECISION_TEXT,
+              reasoning: STUB_REASONING,
+              line: 3,
+            },
+          ],
+        }),
+      },
+    ];
+    writeFileSync(stubPath, JSON.stringify(stubResponses), "utf8");
+
+    const repoRoot = resolve(import.meta.dir, "..");
+    transport = new StdioClientTransport({
+      command: process.execPath,
+      args: ["src/cli/kg.ts", "mcp"],
+      cwd: repoRoot,
+      env: {
+        PATH: process.env.PATH ?? "",
+        HOME: process.env.HOME ?? "",
+        ORGMEM_VAULT: vault,
+        ORGMEM_DB: db,
+        ORGMEM_EXTRACTOR_STUB: stubPath,
+      },
+      stderr: "pipe",
+    });
+    transport.stderr?.on("data", (chunk: Buffer) => {
+      stderrBuf += chunk.toString("utf8");
+    });
+    client = new Client({ name: "orgmem-e2e-extract", version: "0.0.0" }, { capabilities: {} });
+    await client.connect(transport);
+  });
+
+  afterAll(async () => {
+    if (client) await client.close().catch(() => {});
+    if (dir) rmSync(dir, { recursive: true, force: true });
+  });
+
+  test("server boots with extract=stub in the banner", () => {
+    expect(stderrBuf).toContain("extract=stub");
+  });
+
+  test("decisions_extract dryRun returns extracted candidates without writing", async () => {
+    // First create a Meeting node so the extractor has a source to read.
+    const meeting = await callTool(client, "kg_create_node", {
+      type: "Meeting",
+      title: SOURCE_TITLE,
+      content: `# ${SOURCE_TITLE}\n\nNotes:\n- ${STUB_MATCH}.\n- Roll out next sprint.`,
+      date: "2026-04-15",
+    });
+    const before = await callTool(client, "kg_status", {});
+
+    const res = await callTool(client, "decisions_extract", {
+      nodeId: meeting.id,
+      dryRun: true,
+    });
+    expect(res.dryRun).toBe(true);
+    expect(res.sourceDocId).toBe(meeting.id);
+    expect(res.extractedCount).toBe(1);
+    expect(res.extracted[0].text).toBe(STUB_DECISION_TEXT);
+    expect(res.extracted[0].reasoning).toBe(STUB_REASONING);
+    expect(res.extracted[0].line).toBe(3);
+
+    // dryRun must NOT have created any Decision nodes.
+    const after = await callTool(client, "kg_status", {});
+    expect(after.nodes).toBe(before.nodes);
+  });
+
+  test("decisions_extract (write) materializes Decision + decided_in edge", async () => {
+    const meeting = await callTool(client, "kg_get_node", {
+      id: `meeting-2026-04-15-payment-redesign-meeting`,
+    });
+    expect(meeting.node).not.toBeNull();
+    const sourceDocId = meeting.node.id;
+
+    const res = await callTool(client, "decisions_extract", {
+      nodeId: sourceDocId,
+      dryRun: false,
+      date: "2026-04-15",
+    });
+    expect(res.dryRun).toBe(false);
+    expect(res.extractedCount).toBe(1);
+    expect(res.created.length).toBe(1);
+    expect(res.skipped.length).toBe(0);
+    expect(res.errors.length).toBe(0);
+
+    const decisionId = res.created[0].id;
+    expect(decisionId).toMatch(/^decision-2026-04-15-[0-9a-f]{10}$/);
+    const decisionMd = res.created[0].mdPath;
+    const raw = readFileSync(join(vault, decisionMd), "utf8");
+    expect(raw).toContain(STUB_DECISION_TEXT);
+    expect(raw).toContain(`to: ${sourceDocId}`);
+    expect(raw).toContain("relation: decided_in");
+
+    // Source meeting authored the inverse view via list_edges_from_file on the
+    // Decision (the edge lives on the Decision's frontmatter).
+    const list = await callTool(client, "kg_list_edges_from_file", {
+      sourceFile: decisionMd,
+    });
+    expect(list.edges.length).toBe(1);
+    expect(list.edges[0].relation).toBe("decided_in");
+    expect(list.edges[0].dstId).toBe(sourceDocId);
+  });
+
+  test("decisions_extract is idempotent (re-run produces 0 created, 1 skipped)", async () => {
+    const sourceDocId = "meeting-2026-04-15-payment-redesign-meeting";
+    const res = await callTool(client, "decisions_extract", {
+      nodeId: sourceDocId,
+      dryRun: false,
+      date: "2026-04-15",
+    });
+    expect(res.created.length).toBe(0);
+    expect(res.skipped.length).toBe(1);
+    expect(res.skipped[0].alreadyPresent).toBe(true);
   });
 });
