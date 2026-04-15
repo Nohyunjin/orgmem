@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "orgmem": {
+      "command": "bun",
+      "args": ["src/cli/kg.ts", "mcp"],
+      "env": {
+        "ORGMEM_VAULT": "/Users/hyunjin/workspace/orgmem/vault"
+      }
+    }
+  }
+}
