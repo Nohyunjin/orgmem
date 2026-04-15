@@ -64,6 +64,14 @@ jobs:
       - name: Ad-hoc codesign (macOS only)
         if: runner.os == 'macOS'
         run: |
+          # bun --compile emits `adhoc,linker-signed` metadata that
+          # codesign on the GitHub macos-latest runner refuses to
+          # replace in place ("invalid or unsupported format for
+          # signature"). Strip the linker signature first, then apply
+          # a plain ad-hoc sig. `--remove-signature` tolerates the
+          # existing linker-signed data; the `|| true` is belt-and-
+          # suspenders for runner versions that would fail the strip.
+          codesign --remove-signature dist/kg-${{ matrix.target.name }} || true
           codesign --force --sign - dist/kg-${{ matrix.target.name }}
           codesign --verify --verbose dist/kg-${{ matrix.target.name }}
 
