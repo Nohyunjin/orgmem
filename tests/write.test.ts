@@ -12,6 +12,7 @@ import {
   getNode,
   listEdgesFromFile,
   slugify,
+  SLUG_MAX_BYTES,
   TASK_STATUSES,
 } from "../src/graph/index.ts";
 import { parseDoc } from "../src/vault/parser.ts";
@@ -38,6 +39,58 @@ describe("slugify", () => {
   test("empty-ish falls back to timestamp-ish id", () => {
     const out = slugify("  !!!  ");
     expect(out.startsWith("untitled-")).toBe(true);
+  });
+
+  describe("byte cap (SLUG_MAX_BYTES)", () => {
+    const byteLen = (s: string) => new TextEncoder().encode(s).byteLength;
+
+    test("short ASCII passes through unchanged", () => {
+      const out = slugify("hello world");
+      expect(out).toBe("hello-world");
+      expect(byteLen(out)).toBeLessThanOrEqual(SLUG_MAX_BYTES);
+    });
+
+    test("long ASCII truncates at the byte cap", () => {
+      const long = "abcdefghij ".repeat(20); // way over 80 bytes
+      const out = slugify(long);
+      expect(byteLen(out)).toBeLessThanOrEqual(SLUG_MAX_BYTES);
+      // ASCII slugs fill the cap tightly; leave a 3-byte grace window for
+      // the trailing-hyphen trim.
+      expect(byteLen(out)).toBeGreaterThanOrEqual(SLUG_MAX_BYTES - 3);
+      expect(out.endsWith("-")).toBe(false);
+    });
+
+    test("long Korean truncates without splitting a multi-byte character", () => {
+      // 30 syllables × 3 bytes = 90 bytes — forces at least one truncation.
+      const long = "가나다라마바사아자차카타파하거너더러머버서어저처커터퍼허고노도";
+      expect(byteLen(long)).toBeGreaterThan(SLUG_MAX_BYTES);
+      const out = slugify(long);
+      expect(byteLen(out)).toBeLessThanOrEqual(SLUG_MAX_BYTES);
+      // Decoded result must be valid UTF-8 (no U+FFFD replacement chars).
+      expect(out).not.toContain("\uFFFD");
+      // Must be a prefix of the (cleaned) original — i.e. no byte-level glitch
+      // invented a bogus character.
+      expect(long.startsWith(out)).toBe(true);
+    });
+
+    test("long mixed Korean + ASCII truncates on a character boundary", () => {
+      const long =
+        "Payment 결제 전환 결정 2026 결정 payment switch 한글 영문 혼합 결정 문서 긴 제목 테스트 케이스";
+      expect(byteLen(long)).toBeGreaterThan(SLUG_MAX_BYTES);
+      const out = slugify(long);
+      expect(byteLen(out)).toBeLessThanOrEqual(SLUG_MAX_BYTES);
+      expect(out).not.toContain("\uFFFD");
+      expect(out.endsWith("-")).toBe(false);
+    });
+
+    test("cap does not strip a title that fits exactly", () => {
+      // An 80-byte ASCII title is unchanged by the cap.
+      const exactly = "a".repeat(SLUG_MAX_BYTES);
+      expect(byteLen(exactly)).toBe(SLUG_MAX_BYTES);
+      const out = slugify(exactly);
+      expect(out).toBe(exactly);
+      expect(byteLen(out)).toBe(SLUG_MAX_BYTES);
+    });
   });
 });
 
@@ -114,6 +167,33 @@ describe("createNode", () => {
     expect(() =>
       createNode(handle, ws.vault, { type: "Document", title: "   " }),
     ).toThrow(/title is required/);
+  });
+
+  test("long Korean title produces a byte-capped filename + id", () => {
+    const title = "결제 시스템 전환 결정 문서 매우 매우 긴 제목 테스트 한글 파일명 체크 2026년 4월";
+    const r = createNode(handle, ws.vault, { type: "Decision", title, date: "2026-04-15" });
+    const byteLen = (s: string) => new TextEncoder().encode(s).byteLength;
+    // The full mdPath has dir + date prefix + slug + ".md" — cap the slug
+    // portion, but assert the whole file name component stays under a
+    // defensive 120-byte bar so zips / sync clients don't choke.
+    const fileName = r.mdPath.split("/").pop()!;
+    expect(byteLen(fileName)).toBeLessThanOrEqual(120);
+    // Id is prefixed with "decision-YYYY-MM-DD-" (22 bytes) + slug.
+    expect(byteLen(r.id)).toBeLessThanOrEqual(120);
+    // File was actually written at the computed path.
+    expect(existsSync(r.absPath)).toBe(true);
+  });
+
+  test("two identical long Korean titles collide cleanly with -2 suffix", () => {
+    const title = "결제 시스템 전환 결정 문서 매우 매우 긴 제목 테스트 한글 파일명 체크 2026년 4월";
+    const a = createNode(handle, ws.vault, { type: "Decision", title, date: "2026-04-15" });
+    const b = createNode(handle, ws.vault, { type: "Decision", title, date: "2026-04-15" });
+    expect(a.id).not.toBe(b.id);
+    expect(b.id.endsWith("-2")).toBe(true);
+    expect(a.mdPath).not.toBe(b.mdPath);
+    expect(b.mdPath.endsWith("-2.md")).toBe(true);
+    const byteLen = (s: string) => new TextEncoder().encode(s).byteLength;
+    expect(byteLen(b.mdPath.split("/").pop()!)).toBeLessThanOrEqual(120);
   });
 
   test("new node starts with embedding_status='pending'", () => {

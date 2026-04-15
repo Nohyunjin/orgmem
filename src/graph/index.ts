@@ -26,6 +26,7 @@ export {
   appendToNode,
   updateNodeStatus,
   slugify,
+  SLUG_MAX_BYTES,
   TASK_STATUSES,
   isTaskStatus,
 } from "./write.ts";

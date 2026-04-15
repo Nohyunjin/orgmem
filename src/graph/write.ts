@@ -19,11 +19,44 @@ const TYPE_DIR: Record<NodeType, string> = {
 };
 
 /**
+ * Hard cap on slug length measured in UTF-8 BYTES, not code units. 한글
+ * is 3 bytes per character in UTF-8, so a 30-char Korean title is already
+ * 90 bytes — well past APFS/ext4 practical comfort zones and prone to
+ * bloating filenames past third-party tool limits (zip, some cloud sync
+ * clients). 80 bytes leaves headroom for the date prefix ("YYYY-MM-DD-",
+ * 11 bytes), ".md" (3 bytes), type directory, and the "-2"/"-3"
+ * collision suffix, keeping worst-case file paths comfortably under
+ * every modern FS's per-component 255-byte ceiling.
+ */
+export const SLUG_MAX_BYTES = 80;
+
+/**
+ * UTF-8 byte-bounded truncation that never splits a multi-byte character.
+ * Walks backward from the byte cut point past any UTF-8 continuation bytes
+ * (10xxxxxx) so the returned string is always a valid sequence of complete
+ * code points. Trailing hyphens left behind by a mid-token cut are trimmed
+ * so we don't produce ugly `결제-전환-` filenames.
+ */
+function truncateToBytes(s: string, maxBytes: number): string {
+  const enc = new TextEncoder();
+  const buf = enc.encode(s);
+  if (buf.byteLength <= maxBytes) return s;
+  let cut = maxBytes;
+  // If we landed inside a multi-byte sequence (continuation byte 10xxxxxx),
+  // walk back to the start of that code point.
+  while (cut > 0 && (buf[cut]! & 0xc0) === 0x80) cut--;
+  const truncated = new TextDecoder().decode(buf.subarray(0, cut));
+  return truncated.replace(/-+$/, "");
+}
+
+/**
  * Slug rules:
  *   - keep ASCII alphanumerics, CJK (한글/漢字), and hyphens
  *   - collapse whitespace + punctuation runs to a single '-'
  *   - lowercase ASCII
  *   - trim leading/trailing '-'
+ *   - cap the final slug at SLUG_MAX_BYTES bytes (UTF-8), cutting only on
+ *     complete code-point boundaries
  *   - if the slug is empty after normalization (e.g. emoji-only title),
  *     fall back to a timestamp-based identifier
  */
@@ -36,8 +69,8 @@ export function slugify(input: string): string {
     .replace(/-+/g, "-")
     .replace(/^-+|-+$/g, "")
     .toLowerCase();
-  if (cleaned.length > 0) return cleaned;
-  return `untitled-${Date.now().toString(36)}`;
+  if (cleaned.length === 0) return `untitled-${Date.now().toString(36)}`;
+  return truncateToBytes(cleaned, SLUG_MAX_BYTES);
 }
 
 function todayIsoDate(): string {
