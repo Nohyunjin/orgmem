@@ -50,6 +50,38 @@ recap만 찍고 넘어가지 말 것. 메인 세션은 recap을 안 보며, 당�
 
 다른 Lane에 cross-lane 요청 있을 때도 위 규칙 그대로.
 
+## 보안 — permission prompt 선택 규칙 (필수)
+
+Claude Code의 "Do you want to proceed?" 프롬프트에서 옵션 선택 시:
+
+### 절대 금지: env var 인라인 명령에 option 2
+
+**명령어 앞에 `FOO=bar baz` 형태의 env var 할당이 있으면 반드시 option 1 (once only) 선택.**
+
+❌ 금지:
+```
+Do you want to proceed?
+❯ 1. Yes
+  2. Yes, and don't ask again for: ANTHROPIC_API_KEY="sk-ant-..." node scripts/eval.mjs
+```
+여기서 option 2 선택 시 `.claude/settings.local.json`에 **API key 포함 명령 전체가 평문 저장**. 로컬 파일 leak.
+
+✅ 올바른 선택:
+- option 1 (Yes, 이번만) — 매번 묻지만 key 저장 안 됨
+- 또는 env var를 shell에 먼저 export한 뒤 bare 명령 실행:
+  ```bash
+  export ANTHROPIC_API_KEY=sk-ant-...
+  node scripts/eval.mjs  # 이제 이 명령은 option 2로 whitelist해도 안전
+  ```
+
+### env var 없는 일반 명령은 option 2 OK
+
+`git commit -m "msg"`, `npm pack`, `bun test` 같은 env var 없는 명령은 option 2로 whitelist해도 문제 없음.
+
+### 자기 검토
+
+`.claude/settings.local.json` 작성 시 `sk-`, `=sk-ant-`, `API_KEY=`, `PASSWORD=`, `TOKEN=` 같은 패턴이 들어갔으면 즉시 제거 + key rotate.
+
 ## 기타
 
 - 큰 결정(아키텍처 변경, 스코프 확장)은 surface:8로 질문 먼저, 답 받고 실행.
