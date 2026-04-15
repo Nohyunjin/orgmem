@@ -19,6 +19,21 @@ commit SHA when shipped.
 
 ## Unscheduled
 
+- [ ] **Auto-extraction on `kg import`** behind `--extract-decisions` flag. Currently
+  extraction is manual-trigger only (`kg extract-decisions <file>`). Auto-run
+  requires trust in F1 under real traffic; promote after week 4+ usage data.
+- [ ] **Decision deduplication across source docs.** Deterministic ids currently
+  dedupe within a single (sourceDocId, text) pair. If the same decision is
+  mentioned in 3 meeting notes, we'll produce 3 Decision nodes with 3 distinct
+  ids. Future: content-based dedup (sha256 of normalized text) with multiple
+  `decided_in` edges pointing at one canonical Decision.
+- [ ] **Body-anchored Decision edges.** `createEdge` rejects non-zero sourceLine
+  (write.ts:308). Decision `source_line` is parked on frontmatter as metadata
+  for now. Promote to a real edge attribute once body-anchored edges ship.
+- [ ] **Wire `decisions_extract` MCP tool.** Stub at `src/mcp/tools/decisions_extract.ts`
+  should call `extractDecisionsFromDoc` + `materializeDecisions` from
+  `src/extractor/index.ts`. Lane B owns this wiring.
+
 - [ ] FS watcher: wire `lastSelfWriteAt[path]` 2s suppression map between
   engine writes and the chokidar event handler (scaffold lives in
   `src/vault/watcher.ts`).

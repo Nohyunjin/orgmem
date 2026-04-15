@@ -1,8 +1,21 @@
 # Decision Extractor — Integration Plan (Lane C → orgmem)
 
-Status: **draft — awaiting Lane A engine lock confirmation before execution (week 3).**
-Source prompts: locked in probe repo `src/decisions.ts` (commits 2944e92 + d2c3441).
-Eval baseline: CLASSIFY P=1.000 R=0.967 F1=0.983, EXTRACT recall=0.900 (18/20).
+Status: **landed — week 3 port shipped 2026-04-15.**
+Source prompts: locked in probe repo `src/decisions.ts` (commits 2944e92 + d2c3441 + 3be62e4).
+Eval baseline: CLASSIFY P=1.000 R=0.971 F1=0.986 (v1.1 dataset), EXTRACT recall=0.900 (18/20, temp=0 reproducible).
+
+## Execution status (2026-04-15)
+
+- [x] §1 — Goal: port V2 CLASSIFY + V1.1 EXTRACT prompts into orgmem/src/extractor/
+- [x] §3.1 — `src/extractor/{types,prompts,client,classify,extract,materialize,index}.ts`
+- [x] §3.3 — `kg extract-decisions <file>` CLI wired with `--dry-run` / `--json` / `--model` / `--vault`
+- [x] §3.4 — single `decided_in` edge in Decision frontmatter (deterministic id for idempotency)
+- [x] §4.1 — separate `ExtractorClient` (fetch + temp=0 default + JSON salvage parse)
+- [x] §6.3 — per-decision atomicity via `upsertDocNodeAndEdges` BEGIN IMMEDIATE (import.ts pattern)
+- [x] tests/extractor.test.ts — 15 tests (JSON parse, classify, extract, materialize, idempotency, error paths)
+- [x] full suite: 149 pass / 1 pre-existing skip / 0 fail, `tsc --noEmit` clean
+- [ ] §5 — probe-side `--prompt-file` regression-check harness (deferred; not blocking the orgmem port)
+- [ ] Wire real extractor into `src/mcp/tools/decisions_extract.ts` — Lane B owns this; my module is importable from `src/extractor/index.ts`.
 
 ---
 

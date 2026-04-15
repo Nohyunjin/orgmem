@@ -8,6 +8,14 @@ import { countEdges, countNodes } from "../graph/engine.ts";
 import { createOpenAIClient } from "../embeddings/client.ts";
 import { runBackfill } from "../embeddings/backfill.ts";
 import { EMBEDDING_MODEL } from "../embeddings/model.ts";
+import {
+  createExtractorClient,
+  extractDecisionsFromDoc,
+  materializeDecisions,
+  DEFAULT_EXTRACTOR_MODEL,
+} from "../extractor/index.ts";
+import { readFileSync } from "node:fs";
+import { relative, basename } from "node:path";
 
 function printHelp(): void {
   process.stdout.write(
@@ -20,6 +28,9 @@ Commands:
                               flags: --batch-size N (default 32), --max-batches N, --retry-failed
   kg mcp [--vault <path>]   Start the stdio MCP server (Claude Code / Cursor)
                               falls back to $ORGMEM_VAULT if --vault omitted
+  kg extract-decisions <file>  Run Lane C Decision Extractor on a file inside the vault.
+                              Creates Decision nodes + decided_in edges.
+                              flags: --vault <path>, --dry-run, --json, --model <id>
   kg status                 Print node/edge counts + vec status + embedding queue
   kg doctor                 Diagnose sqlite-vec availability
   kg --version
@@ -162,6 +173,129 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (cmd === "extract-decisions") {
+    const args = parseExtractArgs(rest);
+    if (!args.file) {
+      process.stderr.write(
+        `usage: kg extract-decisions <file> [--vault <path>] [--dry-run] [--json] [--model <id>]\n`,
+      );
+      process.exit(2);
+    }
+    const apiKey = process.env.ANTHROPIC_API_KEY;
+    if (!apiKey) {
+      process.stderr.write("ANTHROPIC_API_KEY is required for 'kg extract-decisions'.\n");
+      process.exit(2);
+    }
+    const vaultPath = args.vault ?? process.env.ORGMEM_VAULT;
+    if (!vaultPath) {
+      process.stderr.write(
+        "--vault <path> or $ORGMEM_VAULT is required (the source file must live inside the vault).\n",
+      );
+      process.exit(2);
+    }
+    const vaultResolved = resolve(vaultPath);
+    if (!existsSync(vaultResolved)) {
+      process.stderr.write(`vault not found: ${vaultResolved}\n`);
+      process.exit(2);
+    }
+    const fileResolved = resolve(args.file);
+    if (!existsSync(fileResolved)) {
+      process.stderr.write(`file not found: ${fileResolved}\n`);
+      process.exit(2);
+    }
+    const relPath = relative(vaultResolved, fileResolved);
+    if (relPath.startsWith("..") || relPath.includes("\0")) {
+      process.stderr.write(
+        `file is not inside the vault: ${fileResolved} (vault: ${vaultResolved})\n`,
+      );
+      process.exit(2);
+    }
+
+    runMigrations();
+    const handle = openDb({ path: defaultDbPath(), loadVec: false });
+    try {
+      const row = handle.raw
+        .prepare("SELECT id, type FROM nodes WHERE source_file = ? LIMIT 1;")
+        .get(relPath) as { id: string; type: string } | null;
+      if (!row) {
+        process.stderr.write(
+          `source file '${relPath}' is not imported yet. Run 'kg import ${vaultResolved}' first.\n`,
+        );
+        process.exit(2);
+      }
+      if (row.type !== "Document" && row.type !== "Meeting") {
+        process.stderr.write(
+          `source node '${row.id}' has type '${row.type}'; extract-decisions only supports Document/Meeting.\n`,
+        );
+        process.exit(2);
+      }
+
+      const body = readFileSync(fileResolved, "utf8");
+      const title = basename(relPath, ".md");
+      const client = createExtractorClient({ apiKey, model: args.model });
+
+      let extracted;
+      try {
+        extracted = await extractDecisionsFromDoc(client, title, body);
+      } catch (err) {
+        process.stderr.write(`extractor error: ${(err as Error).message}\n`);
+        process.exit(3);
+      }
+
+      if (args.dryRun) {
+        const out = {
+          sourceDocId: row.id,
+          sourceFile: relPath,
+          dryRun: true,
+          extracted,
+        };
+        if (args.json) {
+          process.stdout.write(JSON.stringify(out, null, 2) + "\n");
+        } else {
+          process.stdout.write(
+            `extracted ${extracted.length} candidate decision(s) from '${relPath}' (dry-run, nothing written).\n`,
+          );
+          for (const e of extracted) {
+            const lineRef = e.line !== null ? ` (line ${e.line})` : "";
+            process.stdout.write(`  - ${e.text.slice(0, 120)}${lineRef}\n`);
+          }
+        }
+        return;
+      }
+
+      const report = materializeDecisions(handle, vaultResolved, row.id, extracted);
+      const payload = {
+        sourceDocId: row.id,
+        sourceFile: relPath,
+        model: args.model ?? DEFAULT_EXTRACTOR_MODEL,
+        extractedCount: extracted.length,
+        created: report.created,
+        skipped: report.skipped,
+        errors: report.errors,
+        wallMs: report.wallMs,
+      };
+      if (args.json) {
+        process.stdout.write(JSON.stringify(payload, null, 2) + "\n");
+      } else {
+        process.stdout.write(
+          `extracted ${extracted.length}, created ${report.created.length}, skipped ${report.skipped.length} (idempotent), errors ${report.errors.length} from '${relPath}' (${report.wallMs}ms)\n`,
+        );
+        for (const c of report.created) {
+          process.stdout.write(`  +  ${c.mdPath}  (${c.id})\n`);
+        }
+        for (const s of report.skipped) {
+          process.stdout.write(`  =  ${s.mdPath}  (${s.id}) [already present]\n`);
+        }
+        for (const e of report.errors) {
+          process.stdout.write(`  !  ${e.text}  — ${e.message}\n`);
+        }
+      }
+    } finally {
+      handle.raw.close();
+    }
+    return;
+  }
+
   if (cmd === "doctor") {
     const handle = openDb({ path: defaultDbPath(), loadVec: true });
     try {
@@ -185,6 +319,46 @@ async function main(): Promise<void> {
 
   process.stderr.write(`unknown command: ${cmd}\nrun 'kg --help' for usage\n`);
   process.exit(2);
+}
+
+interface ExtractArgs {
+  file?: string;
+  vault?: string;
+  model?: string;
+  dryRun?: boolean;
+  json?: boolean;
+}
+
+function parseExtractArgs(rest: string[]): ExtractArgs {
+  const out: ExtractArgs = {};
+  const positional: string[] = [];
+  for (let i = 0; i < rest.length; i++) {
+    const a = rest[i];
+    if (a === "--dry-run") {
+      out.dryRun = true;
+      continue;
+    }
+    if (a === "--json") {
+      out.json = true;
+      continue;
+    }
+    if (a === "--vault") {
+      out.vault = rest[++i];
+      if (!out.vault) throw new Error("--vault requires a path argument");
+      continue;
+    }
+    if (a === "--model") {
+      out.model = rest[++i];
+      if (!out.model) throw new Error("--model requires an id argument");
+      continue;
+    }
+    if (typeof a === "string" && a.startsWith("--")) {
+      throw new Error(`unknown flag for 'kg extract-decisions': ${a}`);
+    }
+    if (typeof a === "string") positional.push(a);
+  }
+  if (positional.length > 0) out.file = positional[0];
+  return out;
 }
 
 interface EmbedArgs {
