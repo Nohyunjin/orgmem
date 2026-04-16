@@ -1,6 +1,6 @@
 {
   "name": "orgmem",
-  "version": "0.1.2",
+  "version": "0.2.0",
   "description": "Agent-native knowledge & work graph. Markdown vault becomes a SQLite graph (nodes + deterministic edges) with sqlite-vec embedding search, exposed to agents over MCP.",
   "keywords": [
     "mcp",

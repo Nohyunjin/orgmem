@@ -6,11 +6,13 @@ A markdown vault is the source of truth; orgmem materializes deterministic
 edges, runs sqlite-vec embedding search, and exposes a 9-tool MCP server
 so Claude Code, Cursor, and other agents can read + write the graph.
 
-> **Status:** Phase 1 weeks 5–6 (distribution). Lane A (graph engine) +
-> Lane B (MCP server, 9 tools) + Lane C (Decision Extractor with locked
-> classify v2 + extract v1.1 prompts) all on `main`. CI green on
-> macOS + Ubuntu. First public release (v0.1.0) cuts once the brew tap
-> sha256 lands.
+> **Status:** v0.2.0 shipped. Heading-split chunking replaces whole-doc
+> embeddings — dogfood flipped the two blocked queries (Approach C
+> rationale + Phase 0 gates) from ❌ to ✅, hitting the 3/6 improvement
+> target. Lane A (graph engine + chunking), Lane B (MCP, 9 tools),
+> Lane C (Decision Extractor, F1=0.983) all on `main`. CI green on
+> macOS + Ubuntu. Binary releases via `brew install Nohyunjin/tap/orgmem`
+> or [GitHub Releases](https://github.com/Nohyunjin/orgmem/releases).
 
 ---
 

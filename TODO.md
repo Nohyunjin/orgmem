@@ -4,6 +4,26 @@ Backlog captured during week-by-week work. Items are scoped to a week when a
 natural slot exists; otherwise "unscheduled". Do not delete — mark `DONE` with
 commit SHA when shipped.
 
+## v0.2.1 — chunking regressions from dogfood (2026-04-16)
+
+- [ ] **interview-template false positive.** v0.1 correctly answered "not
+  found" (no template exists in the vault). v0.2 retrieves a chunk
+  with an "Assignment" heading from a different doc and the LLM
+  over-interprets it as a template. Fix: tighten the ask system prompt
+  to penalize stretching chunk content beyond its stated heading scope,
+  or add a "confidence threshold" that the chunk actually matches the
+  query intent before including it in context.
+
+- [ ] **v2-precision SUMMARY.md chunk ranking slip.** v0.1 ranked the
+  small SUMMARY.md file (4KB) highly and extracted "precision 1.000"
+  correctly. v0.2's chunking splits SUMMARY.md into sections; the
+  precision value's chunk now competes with other chunks from larger
+  docs and ranks lower in the top-5. The answer is partial or
+  off-target. Fix: consider chunk-level score boosting for short docs
+  (all chunks from a 1-chunk doc should inherit the doc-level semantic
+  density advantage), or allow `kg ask --k N` to surface more
+  candidates.
+
 ## Week 6 — distribution
 
 - [ ] **macOS Developer ID notarization for the bun-compile binary.**
