@@ -3,11 +3,29 @@ import { requireVec } from "../storage/sqlite.ts";
 import type { EmbedClient } from "./client.ts";
 import { EMBEDDING_MODEL } from "./model.ts";
 
-export interface PendingRow {
-  id: string;
-  type: string;
-  title: string | null;
-  content: string | null;
+/**
+ * Chunk-level backfill (v0.2).
+ *
+ * v0.1 embedded one vector per node; on docs >5KB this averaged away
+ * tail-of-document signal that dogfood queries depended on. v0.2
+ * switches the retrieval unit to heading-split chunks (see
+ * src/vault/parser.ts::chunkDoc). This module now walks `node_chunks`
+ * instead of `nodes` and writes to `chunk_vec` instead of `node_vec`.
+ *
+ * Input row shape reflects the join we need to build the embed input:
+ * parent node title gives the chunk a short anchor ("Payment spec"),
+ * heading scopes the section ("Goals"), content is the meat. Without
+ * the title prefix, a chunk called "Goals" retrieves weakly against
+ * queries that mention the parent doc's subject.
+ */
+export interface PendingChunk {
+  chunkId: string;
+  nodeId: string;
+  chunkIdx: number;
+  heading: string | null;
+  content: string;
+  nodeTitle: string | null;
+  nodeType: string;
 }
 
 export interface BackfillOptions {
@@ -37,34 +55,54 @@ export interface BackfillReport {
 }
 
 /**
- * Builds the text we actually embed. Concatenating title + content makes
- * queries like "payment spec" hit the node even when the content body
- * uses different vocabulary. Empty nodes fall back to the id so the vec
- * row still exists (required for k-NN coverage); id-only nodes will
- * rank poorly and that's fine.
+ * Builds the text we actually embed for a single chunk. Three pieces,
+ * separated by blank lines, so the vector anchors on doc subject →
+ * section heading → section body:
+ *   1. parent node title (if present)
+ *   2. chunk heading (if present)
+ *   3. chunk content (heading line included inside `content` already
+ *      for H2-split chunks — we still prefix the bare heading so the
+ *      encoder sees it twice, which empirically helps disambiguation
+ *      on short chunks)
+ *
+ * Coarse safety cap at 8000 chars mirrors OpenAI's input ceiling for
+ * text-embedding-3-small. In practice chunks should be ≤ MAX_CHUNK_CHARS
+ * (6000) from the parser so this almost never trims anything.
  */
-export function embeddingInputFor(row: PendingRow): string {
+export function embeddingInputFor(row: PendingChunk): string {
   const parts: string[] = [];
-  if (row.title) parts.push(row.title);
+  if (row.nodeTitle) parts.push(row.nodeTitle);
+  if (row.heading) parts.push(row.heading);
   if (row.content) parts.push(row.content);
-  if (parts.length === 0) parts.push(row.id);
-  return parts.join("\n\n").slice(0, 8000); // coarse safety cap for token budget
+  if (parts.length === 0) parts.push(row.chunkId);
+  return parts.join("\n\n").slice(0, 8000);
 }
 
-function fetchPending(handle: DbHandle, limit: number): PendingRow[] {
+function fetchPending(handle: DbHandle, limit: number): PendingChunk[] {
+  // Join to nodes for title + type; we need both to construct a
+  // meaningful embedding input. updated_at order keeps FIFO fairness
+  // across re-imports.
   return handle.raw
     .prepare(
-      `SELECT id, type, title, content FROM nodes
-       WHERE embedding_status = 'pending'
-       ORDER BY updated_at ASC
+      `SELECT c.chunk_id AS chunkId,
+              c.node_id  AS nodeId,
+              c.chunk_idx AS chunkIdx,
+              c.heading  AS heading,
+              c.content  AS content,
+              n.title    AS nodeTitle,
+              n.type     AS nodeType
+       FROM node_chunks c
+       JOIN nodes n ON n.id = c.node_id
+       WHERE c.embedding_status = 'pending'
+       ORDER BY c.updated_at ASC
        LIMIT ?;`,
     )
-    .all(limit) as PendingRow[];
+    .all(limit) as PendingChunk[];
 }
 
 function countPending(handle: DbHandle): number {
   const row = handle.raw
-    .prepare("SELECT COUNT(*) AS c FROM nodes WHERE embedding_status = 'pending';")
+    .prepare("SELECT COUNT(*) AS c FROM node_chunks WHERE embedding_status = 'pending';")
     .get() as { c: number };
   return row.c;
 }
@@ -72,37 +110,37 @@ function countPending(handle: DbHandle): number {
 function resetFailed(handle: DbHandle): number {
   const res = handle.raw
     .prepare(
-      "UPDATE nodes SET embedding_status='pending', embedding_error=NULL WHERE embedding_status='failed';",
+      "UPDATE node_chunks SET embedding_status='pending', embedding_error=NULL WHERE embedding_status='failed';",
     )
     .run();
   return typeof res.changes === "number" ? res.changes : 0;
 }
 
 /**
- * Writes a batch of (node_id, vector) pairs atomically:
- *   - INSERT OR REPLACE into node_vec
- *   - UPDATE nodes.embedding_status='embedded', embedding_updated_at=now
+ * Writes a batch of (chunk_id, vector) pairs atomically:
+ *   - INSERT OR REPLACE into chunk_vec
+ *   - UPDATE node_chunks.embedding_status='embedded', embedding_updated_at=now
  *
  * If the transaction aborts, neither the vec row nor the status flip
- * survive — the node stays 'pending' and the next --resume call picks
+ * survive — the chunk stays 'pending' and the next --resume call picks
  * it up again.
  */
 function writeBatch(
   handle: DbHandle,
-  items: Array<{ id: string; vector: Float32Array }>,
+  items: Array<{ chunkId: string; vector: Float32Array }>,
 ): void {
   handle.raw.exec("BEGIN IMMEDIATE;");
   try {
     const now = Date.now();
     const insertVec = handle.raw.prepare(
-      "INSERT OR REPLACE INTO node_vec (node_id, embedding) VALUES (?, ?);",
+      "INSERT OR REPLACE INTO chunk_vec (chunk_id, embedding) VALUES (?, ?);",
     );
     const updateStatus = handle.raw.prepare(
-      "UPDATE nodes SET embedding_status='embedded', embedding_error=NULL, embedding_updated_at=? WHERE id=?;",
+      "UPDATE node_chunks SET embedding_status='embedded', embedding_error=NULL, embedding_updated_at=? WHERE chunk_id=?;",
     );
-    for (const { id, vector } of items) {
-      insertVec.run(id, new Uint8Array(vector.buffer, vector.byteOffset, vector.byteLength));
-      updateStatus.run(now, id);
+    for (const { chunkId, vector } of items) {
+      insertVec.run(chunkId, new Uint8Array(vector.buffer, vector.byteOffset, vector.byteLength));
+      updateStatus.run(now, chunkId);
     }
     handle.raw.exec("COMMIT;");
   } catch (err) {
@@ -116,7 +154,7 @@ function markFailed(handle: DbHandle, ids: readonly string[], message: string): 
   handle.raw.exec("BEGIN IMMEDIATE;");
   try {
     const stmt = handle.raw.prepare(
-      "UPDATE nodes SET embedding_status='failed', embedding_error=? WHERE id=?;",
+      "UPDATE node_chunks SET embedding_status='failed', embedding_error=? WHERE chunk_id=?;",
     );
     for (const id of ids) stmt.run(message.slice(0, 500), id);
     handle.raw.exec("COMMIT;");
@@ -162,11 +200,11 @@ export async function runBackfill(
           `embed() returned ${vectors.length} vectors for ${batch.length} inputs`,
         );
       }
-      const items = batch.map((r, i) => ({ id: r.id, vector: vectors[i]! }));
+      const items = batch.map((r, i) => ({ chunkId: r.chunkId, vector: vectors[i]! }));
       writeBatch(handle, items);
       embedded += batch.length;
     } catch (err) {
-      markFailed(handle, batch.map((r) => r.id), (err as Error).message);
+      markFailed(handle, batch.map((r) => r.chunkId), (err as Error).message);
       failed += batch.length;
     }
     processed += batch.length;

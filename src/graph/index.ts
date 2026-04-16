@@ -40,8 +40,14 @@ export type {
   TaskStatus,
 } from "./write.ts";
 
-export { search, formatHits } from "./search.ts";
-export type { SearchHit, SearchNode, Neighbor, SearchOptions } from "./search.ts";
+export { search, formatHits, citationFor } from "./search.ts";
+export type {
+  SearchHit,
+  SearchNode,
+  SearchChunk,
+  Neighbor,
+  SearchOptions,
+} from "./search.ts";
 
 export { computeEdgeId } from "./ids.ts";
 export type { EdgeIdInput } from "./ids.ts";

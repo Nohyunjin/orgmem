@@ -1,22 +1,32 @@
 /**
  * `kg ask` pipeline — search → build grounded prompt → LLM → return.
  *
+ * v0.2 chunk-aware rewrite. Hits now carry heading-split chunk content,
+ * not whole-doc truncated content, so the prompt includes chunks
+ * verbatim (no char cap needed in practice; MAX_CHUNK_CHARS in the
+ * parser caps them at ~6000 / ~1500 tokens each).
+ *
  * Contract highlights:
- *  - Empty-hits fast-path: if the vec search returns 0 rows, we return a
- *    canned "no relevant nodes" answer WITHOUT calling the LLM. This keeps
- *    freshly-imported empty graphs from burning API calls and from emitting
- *    hallucinated answers.
- *  - Grounding: the system prompt tells the model to answer ONLY from
- *    context and to cite every claim with `[[node-id]]`. The user prompt
- *    serializes each hit with id, title, (clipped) content, and one-hop
- *    edges — titles only on neighbors, no bodies, to stay under token
- *    budget.
- *  - Return shape includes the raw hits so the caller (CLI or future MCP
- *    tool) can render citations, follow edges, or display the trail.
+ *  - Empty-hits fast-path: if vec search returns 0 rows we return a
+ *    canned "no relevant chunks" answer WITHOUT calling the LLM.
+ *    Saves tokens on empty / unembeded graphs and prevents slop.
+ *  - Grounding: the system prompt instructs the model to cite every
+ *    factual claim with `[[node-id#heading]]` (or bare `[[node-id]]`
+ *    for chunks with no heading). The user prompt serializes each
+ *    hit with its citation, parent node title, chunk heading, full
+ *    chunk content, and the parent node's 1-hop edges.
+ *  - Return shape includes the raw hits so the caller (CLI or MCP
+ *    tool) can render citations, follow edges, or deep-link the user
+ *    into the source file at `chunk.startLine`.
  */
 import type { DbHandle } from "../storage/sqlite.ts";
 import type { EmbedClient } from "../embeddings/client.ts";
-import { search, formatHits, type SearchHit } from "../graph/search.ts";
+import {
+  search,
+  formatHits,
+  citationFor,
+  type SearchHit,
+} from "../graph/search.ts";
 import type { AnswerClient, AnswerResponse } from "./client.ts";
 
 export interface AskOptions {
@@ -24,7 +34,10 @@ export interface AskOptions {
   k?: number;
   /** Cap on 1-hop neighbors per hit per direction. Default 6. */
   neighborCap?: number;
-  /** Per-hit content-body clip (chars). Default 1200. */
+  /** Per-hit content clip (chars). Chunks stay under MAX_CHUNK_CHARS
+   *  (6000) by construction, so the default here is generous and
+   *  almost never trims. Kept for defence against the "chunker left a
+   *  pathological oversize chunk unsplit" case. */
   contentCharCap?: number;
   /** Override max_tokens for the LLM response. */
   maxTokens?: number;
@@ -41,18 +54,20 @@ export interface AskResult {
 
 const DEFAULT_K = 5;
 const DEFAULT_NEIGHBOR_CAP = 6;
-const DEFAULT_CONTENT_CHAR_CAP = 1200;
+const DEFAULT_CONTENT_CHAR_CAP = 6000;
 
 const SYSTEM_PROMPT = `You are a careful assistant answering questions from a knowledge graph.
 
+Each context block is a CHUNK extracted from a larger document by heading split. The chunk's citation form is \`[[node-id#heading]]\` when a heading is present, or \`[[node-id]]\` for a chunk with no heading (intro / whole-doc chunks).
+
 Rules:
-- Answer ONLY from the provided context. If the context does not contain the answer, say so explicitly — do not guess.
-- Cite every factual claim with the node id in double brackets, e.g. [[doc-spec]].
-- Do not invent node ids, titles, or edges that are not in the context.
+- Answer ONLY from the provided context. If the context does not contain the answer, say so explicitly — do not guess, do not fill in from prior knowledge.
+- Cite every factual claim with the chunk's citation exactly as provided, in double brackets. Example: [[doc-payment-spec#Goals]].
+- Do not invent node ids, headings, or edges that are not in the context.
 - Prefer concise answers. Use bullet points when listing multiple items.`;
 
 const EMPTY_ANSWER =
-  "No relevant nodes found in the graph for this query. " +
+  "No relevant chunks found in the graph for this query. " +
   "Either the graph has no embeddings yet (run `kg embed`) or the question is out of scope.";
 
 export function buildUserPrompt(query: string, hits: SearchHit[], charCap: number): string {
@@ -62,25 +77,28 @@ export function buildUserPrompt(query: string, hits: SearchHit[], charCap: numbe
   parts.push("");
   parts.push(`# Context (${hits.length} hit${hits.length === 1 ? "" : "s"})`);
   for (const h of hits) {
+    const cite = citationFor(h);
     const title = h.node.title ? ` "${h.node.title}"` : "";
     parts.push("");
     parts.push(
-      `## Hit ${h.rank} (distance ${h.distance.toFixed(4)}) — [[${h.node.id}]]${title}`,
+      `## Hit ${h.rank} (distance ${h.distance.toFixed(4)}) — [[${cite}]]${title}`,
     );
-    if (h.node.sourceFile) {
-      parts.push(`source: ${h.node.sourceFile}`);
-    }
-    if (h.node.content) {
+    const locator = h.node.sourceFile
+      ? `source: ${h.node.sourceFile}:${h.chunk.startLine}`
+      : `chunk: ${h.chunk.chunkId}`;
+    parts.push(locator);
+
+    if (h.chunk.content) {
       const clipped =
-        h.node.content.length > charCap
-          ? h.node.content.slice(0, charCap) + "…"
-          : h.node.content;
+        h.chunk.content.length > charCap
+          ? h.chunk.content.slice(0, charCap) + "…"
+          : h.chunk.content;
       parts.push("");
       parts.push(clipped);
     }
     if (h.directEdges.length > 0) {
       parts.push("");
-      parts.push("Outgoing edges:");
+      parts.push("Outgoing edges (from parent node):");
       for (const n of h.directEdges) {
         const far = n.node
           ? `[[${n.node.id}]]${n.node.title ? ` "${n.node.title}"` : ""}`
@@ -90,7 +108,7 @@ export function buildUserPrompt(query: string, hits: SearchHit[], charCap: numbe
     }
     if (h.inverseEdges.length > 0) {
       parts.push("");
-      parts.push("Incoming edges:");
+      parts.push("Incoming edges (to parent node):");
       for (const n of h.inverseEdges) {
         const far = n.node
           ? `[[${n.node.id}]]${n.node.title ? ` "${n.node.title}"` : ""}`
@@ -101,7 +119,7 @@ export function buildUserPrompt(query: string, hits: SearchHit[], charCap: numbe
   }
   parts.push("");
   parts.push(
-    `Answer the query using only the context above. Cite with [[node-id]]. If the context is insufficient, say so.`,
+    `Answer the query using only the context above. Cite with the exact [[node-id#heading]] tags shown. If the context is insufficient, say so.`,
   );
   return parts.join("\n");
 }

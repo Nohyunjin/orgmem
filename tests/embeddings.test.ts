@@ -24,8 +24,11 @@ function fakeVec(seed: number): Float32Array {
   return v;
 }
 
-function writeSampleVault(vault: string): Map<string, string> {
-  const inputs = new Map<string, string>();
+function writeSampleVault(vault: string): void {
+  // Each sample doc has no H2, so chunkDoc emits exactly one chunk per
+  // doc (heading=null, content=whole body). embeddingInputFor for such
+  // a chunk collapses to `${nodeTitle}\n\n${content}` — identical to the
+  // v0.1 node-level input string, so stub-client maps still work.
   for (let i = 0; i < 5; i++) {
     const slug = `doc-${String(i).padStart(2, "0")}`;
     writeFileSync(
@@ -40,14 +43,10 @@ title: "Doc ${i}"
 Content for node ${i}.
 `,
     );
-    const title = `Doc ${i}`;
-    const body = `# Doc ${i}\n\nContent for node ${i}.\n`;
-    inputs.set(slug, `${title}\n\n${body}`);
   }
-  return inputs;
 }
 
-describe("embeddings backfill", () => {
+describe("embeddings backfill (chunk-level, v0.2)", () => {
   let ws: ReturnType<typeof mkWs>;
   let handle: DbHandle;
 
@@ -63,15 +62,16 @@ describe("embeddings backfill", () => {
     rmSync(ws.dir, { recursive: true, force: true });
   });
 
-  test("import marks all new nodes as pending", () => {
+  test("import marks all new chunks as pending", () => {
     const rows = handle.raw
-      .prepare("SELECT id, embedding_status FROM nodes ORDER BY id;")
-      .all() as Array<{ id: string; embedding_status: string }>;
+      .prepare("SELECT chunk_id, embedding_status FROM node_chunks ORDER BY chunk_id;")
+      .all() as Array<{ chunk_id: string; embedding_status: string }>;
+    // One chunk per sample doc (no H2).
     expect(rows.length).toBe(5);
     for (const r of rows) expect(r.embedding_status).toBe("pending");
   });
 
-  test("runBackfill embeds everything with a stub client", async () => {
+  test("runBackfill embeds every chunk with a stub client", async () => {
     const map = new Map<string, Float32Array>();
     for (let i = 0; i < 5; i++) {
       map.set(`Doc ${i}\n\n# Doc ${i}\n\nContent for node ${i}.\n`, fakeVec(i));
@@ -84,17 +84,17 @@ describe("embeddings backfill", () => {
     expect(report.batchesRun).toBeGreaterThanOrEqual(3);
 
     const rows = handle.raw
-      .prepare("SELECT embedding_status FROM nodes;")
+      .prepare("SELECT embedding_status FROM node_chunks;")
       .all() as Array<{ embedding_status: string }>;
     for (const r of rows) expect(r.embedding_status).toBe("embedded");
 
     const vecCount = (
-      handle.raw.prepare("SELECT COUNT(*) AS c FROM node_vec;").get() as { c: number }
+      handle.raw.prepare("SELECT COUNT(*) AS c FROM chunk_vec;").get() as { c: number }
     ).c;
     expect(vecCount).toBe(5);
   });
 
-  test("second runBackfill is a no-op on already-embedded nodes", async () => {
+  test("second runBackfill is a no-op on already-embedded chunks", async () => {
     const map = new Map<string, Float32Array>();
     for (let i = 0; i < 5; i++) {
       map.set(`Doc ${i}\n\n# Doc ${i}\n\nContent for node ${i}.\n`, fakeVec(i));
@@ -106,7 +106,7 @@ describe("embeddings backfill", () => {
     expect(second.total).toBe(0);
   });
 
-  test("a failing embed marks nodes failed, and retryFailed flips them back", async () => {
+  test("a failing embed marks chunks failed, and retryFailed flips them back", async () => {
     const alwaysFailing = {
       embed: async () => {
         throw new Error("HTTP 500: synthesized failure");
@@ -117,7 +117,7 @@ describe("embeddings backfill", () => {
 
     const failedCount = (
       handle.raw
-        .prepare("SELECT COUNT(*) AS c FROM nodes WHERE embedding_status='failed';")
+        .prepare("SELECT COUNT(*) AS c FROM node_chunks WHERE embedding_status='failed';")
         .get() as { c: number }
     ).c;
     expect(failedCount).toBeGreaterThan(0);
@@ -132,7 +132,7 @@ describe("embeddings backfill", () => {
     expect(retry.failed).toBe(0);
   });
 
-  test("content change on reindex flips embedded → pending", async () => {
+  test("content change on reindex flips only the affected chunk back to pending", async () => {
     const map = new Map<string, Float32Array>();
     for (let i = 0; i < 5; i++) {
       map.set(`Doc ${i}\n\n# Doc ${i}\n\nContent for node ${i}.\n`, fakeVec(i));
@@ -156,11 +156,12 @@ CHANGED body.
     importVault(handle, ws.vault);
 
     const statuses = handle.raw
-      .prepare("SELECT id, embedding_status FROM nodes ORDER BY id;")
+      .prepare(
+        "SELECT node_id AS id, embedding_status FROM node_chunks ORDER BY chunk_id;",
+      )
       .all() as Array<{ id: string; embedding_status: string }>;
     const doc00 = statuses.find((s) => s.id === "doc-00");
     expect(doc00?.embedding_status).toBe("pending");
-    // The unchanged docs should stay 'embedded'.
     for (const s of statuses) {
       if (s.id !== "doc-00") expect(s.embedding_status).toBe("embedded");
     }
@@ -214,13 +215,43 @@ describe("OpenAI client 429 retry", () => {
   });
 });
 
-describe("embeddingInputFor", () => {
-  test("joins title + content with blank line", () => {
-    const out = embeddingInputFor({ id: "x", type: "Document", title: "Hello", content: "Body." });
-    expect(out).toBe("Hello\n\nBody.");
+describe("embeddingInputFor (chunk row)", () => {
+  test("joins parent title + heading + content", () => {
+    const out = embeddingInputFor({
+      chunkId: "doc-x#1",
+      nodeId: "doc-x",
+      chunkIdx: 1,
+      heading: "Goals",
+      content: "Ship Toss PG.",
+      nodeTitle: "Payment spec",
+      nodeType: "Document",
+    });
+    expect(out).toBe("Payment spec\n\nGoals\n\nShip Toss PG.");
   });
-  test("falls back to id when title/content are missing", () => {
-    const out = embeddingInputFor({ id: "only-id", type: "Document", title: null, content: null });
-    expect(out).toBe("only-id");
+
+  test("omits missing title and heading", () => {
+    const out = embeddingInputFor({
+      chunkId: "x#0",
+      nodeId: "x",
+      chunkIdx: 0,
+      heading: null,
+      content: "body only",
+      nodeTitle: null,
+      nodeType: "Document",
+    });
+    expect(out).toBe("body only");
+  });
+
+  test("falls back to chunk_id when every piece is missing", () => {
+    const out = embeddingInputFor({
+      chunkId: "only-id#0",
+      nodeId: "only-id",
+      chunkIdx: 0,
+      heading: null,
+      content: "",
+      nodeTitle: null,
+      nodeType: "Document",
+    });
+    expect(out).toBe("only-id#0");
   });
 });

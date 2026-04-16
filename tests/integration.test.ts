@@ -184,28 +184,34 @@ describe("e2e hermetic: init → import → embed → search → ask", () => {
     expect(countEdges(handle)).toBe(5);
   });
 
-  test("embed fills node_vec for every imported node (stub embed)", async () => {
+  test("embed fills chunk_vec for every imported chunk (stub embed)", async () => {
     importVault(handle, ws.vault);
     const client = deterministicEmbed();
+    // Sample docs have no H2 → one chunk per doc → 4 chunks for 4 nodes.
+    const chunkCount = (
+      handle.raw.prepare("SELECT COUNT(*) AS c FROM node_chunks;").get() as { c: number }
+    ).c;
     const report = await runBackfill(handle, client, { batchSize: 4 });
-    expect(report.total).toBe(4);
-    expect(report.embedded).toBe(4);
+    expect(report.total).toBe(chunkCount);
+    expect(report.embedded).toBe(chunkCount);
     expect(report.failed).toBe(0);
 
-    const vecCount = handle.raw.prepare("SELECT COUNT(*) AS c FROM node_vec;").get() as {
+    const vecCount = handle.raw.prepare("SELECT COUNT(*) AS c FROM chunk_vec;").get() as {
       c: number;
     };
-    expect(vecCount.c).toBe(4);
+    expect(vecCount.c).toBe(chunkCount);
 
     const statusRows = handle.raw
-      .prepare("SELECT embedding_status AS s, COUNT(*) AS c FROM nodes GROUP BY embedding_status;")
+      .prepare(
+        "SELECT embedding_status AS s, COUNT(*) AS c FROM node_chunks GROUP BY embedding_status;",
+      )
       .all() as Array<{ s: string; c: number }>;
     const byStatus = new Map(statusRows.map((r) => [r.s, r.c]));
-    expect(byStatus.get("embedded")).toBe(4);
+    expect(byStatus.get("embedded")).toBe(chunkCount);
     expect(byStatus.get("pending") ?? 0).toBe(0);
   });
 
-  test("search returns hits with 1-hop neighbors after embed", async () => {
+  test("search returns chunk hits + 1-hop neighbors of the parent node after embed", async () => {
     importVault(handle, ws.vault);
     const client = deterministicEmbed();
     await runBackfill(handle, client, { batchSize: 4 });
@@ -213,12 +219,15 @@ describe("e2e hermetic: init → import → embed → search → ask", () => {
     const hits = await search(handle, client, "switch to toss pg", { k: 3 });
     expect(hits.length).toBeGreaterThan(0);
 
-    // Each hit node must exist in the DB (no orphan vec rows).
+    // Each hit carries both a chunk and its parent node.
     for (const h of hits) {
+      expect(h.chunk.chunkId).toBeTruthy();
       expect(h.node.id).toBeTruthy();
+      expect(h.chunk.nodeId).toBe(h.node.id);
     }
 
-    // The decision node (if it appears) should surface its decided_in edge.
+    // If the decision chunk surfaces, its PARENT NODE should carry the
+    // Decision's frontmatter edges (decided_in, drives).
     const decisionHit = hits.find((h) => h.node.id === "decision-switch-to-toss");
     if (decisionHit) {
       const relations = decisionHit.directEdges.map((n) => n.relation);

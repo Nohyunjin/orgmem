@@ -141,16 +141,25 @@ async function main(): Promise<void> {
     }
     const handle = openDb({ path: defaultDbPath(), loadVec: true });
     try {
+      // v0.2: embed queue is now chunk-level. Legacy nodes.embedding_status
+      // is still written by the engine for the initial import but
+      // backfill + search + ask all flow through chunks.
       const statusRows = handle.raw
-        .prepare("SELECT embedding_status AS s, COUNT(*) AS c FROM nodes GROUP BY embedding_status;")
+        .prepare(
+          "SELECT embedding_status AS s, COUNT(*) AS c FROM node_chunks GROUP BY embedding_status;",
+        )
         .all() as Array<{ s: string; c: number }>;
       const embedQueue: Record<string, number> = { pending: 0, embedded: 0, failed: 0 };
       for (const r of statusRows) embedQueue[r.s] = r.c;
+      const chunkCount = (
+        handle.raw.prepare("SELECT COUNT(*) AS c FROM node_chunks;").get() as { c: number }
+      ).c;
       const out = {
         db: handle.path,
         exists: true,
         nodes: countNodes(handle),
         edges: countEdges(handle),
+        chunks: chunkCount,
         vecLoaded: handle.vecLoaded,
         vecError: handle.vecError ?? null,
         embedQueue,
@@ -472,17 +481,22 @@ async function main(): Promise<void> {
         };
       }
 
-      // Embedding queue state — counts by status. A pending count > 0
+      // Embedding queue state — chunk-level (v0.2). A pending count > 0
       // means `kg embed` has work to do; failed > 0 means retry is useful.
       try {
         const rows = handle.raw
-          .prepare("SELECT embedding_status AS s, COUNT(*) AS c FROM nodes GROUP BY embedding_status;")
+          .prepare(
+            "SELECT embedding_status AS s, COUNT(*) AS c FROM node_chunks GROUP BY embedding_status;",
+          )
           .all() as Array<{ s: string; c: number }>;
         const queue: Record<string, number> = { pending: 0, embedded: 0, failed: 0 };
         for (const r of rows) queue[r.s] = r.c;
         out.embedQueue = queue;
         out.totalNodes = countNodes(handle);
         out.totalEdges = countEdges(handle);
+        out.totalChunks = (
+          handle.raw.prepare("SELECT COUNT(*) AS c FROM node_chunks;").get() as { c: number }
+        ).c;
       } catch (err) {
         out.embedQueue = { error: `queue probe failed: ${(err as Error).message}` };
       }
