@@ -198,7 +198,15 @@ export function requireVec(handle: DbHandle): void {
  */
 export function ensureVecTable(handle: DbHandle, dim: number): void {
   requireVec(handle);
+  // v0.1 node-level vec. Still created for now so existing backfills
+  // (Day 2 of v0.2 will flip them) keep working; Day 2 drops the
+  // reads but the table stays harmless until a later cleanup.
   handle.raw.exec(
     `CREATE VIRTUAL TABLE IF NOT EXISTS node_vec USING vec0(node_id TEXT PRIMARY KEY, embedding FLOAT[${dim}]);`,
+  );
+  // v0.2 chunk-level vec — heading-split retrieval unit, populated by
+  // the chunk backfill. Keys on chunk_id (e.g. "doc-payment-spec#3").
+  handle.raw.exec(
+    `CREATE VIRTUAL TABLE IF NOT EXISTS chunk_vec USING vec0(chunk_id TEXT PRIMARY KEY, embedding FLOAT[${dim}]);`,
   );
 }

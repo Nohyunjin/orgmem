@@ -8,6 +8,7 @@
 
 import sql_0 from "./migrations/0000_curved_lenny_balinger.sql" with { type: "text" };
 import sql_1 from "./migrations/0001_clammy_whistler.sql" with { type: "text" };
+import sql_2 from "./migrations/0002_chunking.sql" with { type: "text" };
 
 export interface EmbeddedMigration {
   /** Stem of the SQL filename, e.g. '0000_curved_lenny_balinger'. */
@@ -21,4 +22,5 @@ export interface EmbeddedMigration {
 export const MIGRATIONS: readonly EmbeddedMigration[] = [
   { name: "0000_curved_lenny_balinger", sql: sql_0, checksum: "6ca0c3764486c465764689021dbd6e606ced3565e8dcf823244cc0ecd8a31750" },
   { name: "0001_clammy_whistler", sql: sql_1, checksum: "2c3d006caeb176b97dfaa09107beb5d8b86754044afc9635dea3b67d72001e78" },
+  { name: "0002_chunking", sql: sql_2, checksum: "52086c075491840788b22e3d491f879b5baa3b23e634f477619c4db5aaa9bd3e" },
 ];

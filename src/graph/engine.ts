@@ -1,14 +1,24 @@
 import { and, eq, inArray, not } from "drizzle-orm";
 import type { DbHandle } from "../storage/sqlite.ts";
-import { nodes, edges } from "../storage/schema.ts";
+import { nodes, edges, nodeChunks } from "../storage/schema.ts";
 import { computeEdgeId } from "./ids.ts";
 import type { GraphEdge, GraphNode, RelationType } from "./types.ts";
-import type { ParsedDoc } from "../vault/parser.ts";
+import type { ParsedDoc, DocChunk } from "../vault/parser.ts";
+import { chunkDoc } from "../vault/parser.ts";
 
 export interface UpsertResult {
   nodeId: string;
   edgesWritten: number;
   edgesDeleted: number;
+  chunksWritten: number;
+  chunksDeleted: number;
+}
+
+/** Deterministic chunk id: node-scoped index. Stable across reindexes as long
+ *  as the ordered chunk list doesn't change; insertions / deletions shift
+ *  suffix indices but UPSERT + "DELETE WHERE NOT IN" reconciles cleanly. */
+function chunkIdFor(nodeId: string, chunkIdx: number): string {
+  return `${nodeId}#${chunkIdx}`;
 }
 
 /**
@@ -165,8 +175,88 @@ export function upsertDocNodeAndEdges(handle: DbHandle, sourceFile: string, doc:
       deletedCount = typeof res.changes === "number" ? res.changes : 0;
     }
 
+    // v0.2 chunks: heading-split retrieval units. Same atomicity as
+    // edges — compute the desired set, UPSERT, then DELETE-NOT-IN.
+    // embedding_status is preserved across reindexes for chunks whose
+    // content_hash didn't change; edits flip the chunk back to 'pending'
+    // so the next `kg embed` picks it up.
+    const desiredChunks = chunkDoc(doc);
+    const existingChunks = handle.raw
+      .prepare(
+        "SELECT chunk_id, content_hash, embedding_status FROM node_chunks WHERE node_id = ?;",
+      )
+      .all(doc.id) as Array<{ chunk_id: string; content_hash: string; embedding_status: string }>;
+    const existingByChunkId = new Map(
+      existingChunks.map((r) => [r.chunk_id, { hash: r.content_hash, status: r.embedding_status }]),
+    );
+
+    let chunksWritten = 0;
+    const keepChunkIds: string[] = [];
+    const upsertChunk = handle.raw.prepare(
+      `INSERT INTO node_chunks (
+         chunk_id, node_id, chunk_idx, heading, content, content_hash,
+         start_line, end_line, embedding_status, embedding_error,
+         embedding_updated_at, created_at, updated_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)
+       ON CONFLICT(chunk_id) DO UPDATE SET
+         chunk_idx = excluded.chunk_idx,
+         heading = excluded.heading,
+         content = excluded.content,
+         content_hash = excluded.content_hash,
+         start_line = excluded.start_line,
+         end_line = excluded.end_line,
+         embedding_status = excluded.embedding_status,
+         embedding_error = CASE
+           WHEN excluded.embedding_status = 'pending' THEN NULL
+           ELSE node_chunks.embedding_error
+         END,
+         updated_at = excluded.updated_at;`,
+    );
+    for (const c of desiredChunks) {
+      const id = chunkIdFor(doc.id, c.chunkIdx);
+      keepChunkIds.push(id);
+      const prior = existingByChunkId.get(id);
+      const nextStatus = !prior || prior.hash !== c.contentHash ? "pending" : prior.status;
+      upsertChunk.run(
+        id,
+        doc.id,
+        c.chunkIdx,
+        c.heading,
+        c.content,
+        c.contentHash,
+        c.startLine,
+        c.endLine,
+        nextStatus,
+        now,
+        now,
+      );
+      chunksWritten += 1;
+    }
+
+    let chunksDeleted = 0;
+    if (keepChunkIds.length === 0) {
+      const res = handle.raw
+        .prepare("DELETE FROM node_chunks WHERE node_id = ?;")
+        .run(doc.id);
+      chunksDeleted = typeof res.changes === "number" ? res.changes : 0;
+    } else {
+      const placeholders = keepChunkIds.map(() => "?").join(",");
+      const res = handle.raw
+        .prepare(
+          `DELETE FROM node_chunks WHERE node_id = ? AND chunk_id NOT IN (${placeholders});`,
+        )
+        .run(doc.id, ...keepChunkIds);
+      chunksDeleted = typeof res.changes === "number" ? res.changes : 0;
+    }
+
     handle.raw.exec("COMMIT;");
-    return { nodeId: doc.id, edgesWritten: uniqueEdges.length, edgesDeleted: deletedCount };
+    return {
+      nodeId: doc.id,
+      edgesWritten: uniqueEdges.length,
+      edgesDeleted: deletedCount,
+      chunksWritten,
+      chunksDeleted,
+    };
   } catch (err) {
     handle.raw.exec("ROLLBACK;");
     throw err;

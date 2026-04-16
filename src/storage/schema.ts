@@ -77,6 +77,45 @@ export const edges = sqliteTable(
  * This row stores (node_id, model, dim, updated_at) so the runtime can
  * invalidate stale vectors without touching the vec0 blob.
  */
+/**
+ * node_chunks: heading-split retrieval units produced by `chunkDoc()`.
+ *
+ * Each chunk_id is `${node_id}#${chunk_idx}` — stable across reindexes
+ * as long as the ordered list of chunks doesn't change. Content edits
+ * inside a chunk change content_hash only; reordering adds new ids and
+ * prunes the old ones in a single transaction, same pattern as `edges`.
+ *
+ * Chunking rationale lives in src/vault/parser.ts::chunkDoc. The v0.1
+ * "one embedding per node" design lost tail-of-document signal on 15KB
+ * design docs to the 8000-char embed cap; chunks restore it.
+ *
+ * embedding_status mirrors the node-level field: 'pending' | 'embedded'
+ * | 'failed'. Backfill (Day 2 of v0.2) flips status to 'embedded' only
+ * when a vector has been written to `chunk_vec`.
+ */
+export const nodeChunks = sqliteTable(
+  "node_chunks",
+  {
+    chunkId: text("chunk_id").primaryKey(),
+    nodeId: text("node_id").notNull(),
+    chunkIdx: integer("chunk_idx", { mode: "number" }).notNull(),
+    heading: text("heading"),
+    content: text("content").notNull(),
+    contentHash: text("content_hash").notNull(),
+    startLine: integer("start_line", { mode: "number" }).notNull(),
+    endLine: integer("end_line", { mode: "number" }).notNull(),
+    embeddingStatus: text("embedding_status").notNull().default("pending"),
+    embeddingError: text("embedding_error"),
+    embeddingUpdatedAt: integer("embedding_updated_at", { mode: "number" }),
+    createdAt: integer("created_at", { mode: "number" }).notNull(),
+    updatedAt: integer("updated_at", { mode: "number" }).notNull(),
+  },
+  (t) => ({
+    byNodeId: index("node_chunks_node_id_idx").on(t.nodeId),
+    byEmbeddingStatus: index("node_chunks_embedding_status_idx").on(t.embeddingStatus),
+  }),
+);
+
 export const nodeEmbeddings = sqliteTable(
   "node_embeddings",
   {

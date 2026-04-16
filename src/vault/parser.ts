@@ -191,6 +191,208 @@ export function parseDoc(input: ParseInput): ParsedDoc {
  * live outside our "authoritative" subset. Round-trip equality is asserted on
  * the parsed representation, not on the raw bytes.
  */
+/**
+ * A heading-split chunk of a document. The goal is to give the vec-search
+ * layer a retrieval unit small enough to embed faithfully — whole-doc
+ * embeddings on 15KB+ design docs lost critical tail content (decision
+ * markers, phase gates) to truncation at 8000 chars and blurred the
+ * query signal across unrelated sections. H2 split restores both.
+ *
+ * Chunking rules:
+ *   - Split on H2 (`## …`). Content before the first H2 becomes an
+ *     "intro" chunk with heading=null.
+ *   - Docs with no H2 at all produce exactly one chunk covering the
+ *     entire body (heading=null).
+ *   - Chunks shorter than MIN_CHUNK_CHARS merge into the PREVIOUS
+ *     chunk (the first chunk is never merged-into-itself). This keeps
+ *     "Overview" / "Summary" sections co-located with their parent.
+ *   - Chunks longer than MAX_CHUNK_CHARS are sub-split at H3. If any
+ *     H3 section is still too big we leave it as-is (chunk stability
+ *     matters more than perfect size; a pathological 10KB paragraph
+ *     stays together so its retrieval key doesn't flicker).
+ *   - start_line / end_line are 1-based and reference the raw source
+ *     file, not the body. Uses bodyStartLine to offset.
+ */
+export interface DocChunk {
+  /** 0-based position within the doc's chunk list. */
+  chunkIdx: number;
+  /** Heading text (without the `## ` prefix). null for intro / no-heading docs. */
+  heading: string | null;
+  /** Raw markdown content of the chunk, including the heading line if present. */
+  content: string;
+  /** sha256 of `content` — used by the engine to decide re-embedding. */
+  contentHash: string;
+  /** 1-based line in the source file where this chunk begins. */
+  startLine: number;
+  /** 1-based line in the source file where this chunk ends (inclusive). */
+  endLine: number;
+}
+
+/** Coarse char → token approximation. OpenAI tokens are ~4 chars on
+ *  mixed English/markdown; tighter on Korean (~1–2 chars). The
+ *  MIN/MAX bounds below assume char count, so 400/6000 ≈ 100/1500
+ *  tokens of English prose or ~200/3000 tokens of Korean. */
+const MIN_CHUNK_CHARS = 400;
+const MAX_CHUNK_CHARS = 6000;
+
+function hashContentBytes(s: string): string {
+  return createHash("sha256").update(s, "utf8").digest("hex");
+}
+
+interface RawSection {
+  heading: string | null;
+  content: string;
+  startLine: number;
+  endLine: number;
+}
+
+function splitOnHeading(body: string, bodyStartLine: number, level: 2 | 3): RawSection[] {
+  const lines = body.split("\n");
+  const pattern = level === 2 ? /^##\s+(.+?)\s*$/ : /^###\s+(.+?)\s*$/;
+  const sections: RawSection[] = [];
+  let current: RawSection | null = null;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]!;
+    const m = line.match(pattern);
+    if (m) {
+      if (current) {
+        current.endLine = bodyStartLine + i - 1;
+        sections.push(current);
+      }
+      current = {
+        heading: m[1]!.trim(),
+        content: line + "\n",
+        startLine: bodyStartLine + i,
+        endLine: bodyStartLine + i,
+      };
+    } else if (current) {
+      current.content += line + (i < lines.length - 1 ? "\n" : "");
+    } else {
+      // Intro content before the first heading
+      if (sections.length === 0) {
+        sections.push({
+          heading: null,
+          content: line + (i < lines.length - 1 ? "\n" : ""),
+          startLine: bodyStartLine,
+          endLine: bodyStartLine + i,
+        });
+      } else {
+        const intro = sections[0]!;
+        intro.content += (intro.content.endsWith("\n") ? "" : "\n") + line + (i < lines.length - 1 ? "\n" : "");
+        intro.endLine = bodyStartLine + i;
+      }
+    }
+  }
+  if (current) {
+    current.endLine = bodyStartLine + lines.length - 1;
+    sections.push(current);
+  }
+  // Trim a possible empty intro (e.g. body started with "## Heading" immediately)
+  if (sections.length > 0 && sections[0]!.heading === null && sections[0]!.content.trim().length === 0) {
+    sections.shift();
+  }
+  return sections;
+}
+
+/**
+ * Split a parsed doc's body into chunks suitable for embedding.
+ *
+ * Always returns at least one chunk: a doc with no H2 and no body
+ * still gets one chunk (content = body, heading = null). The caller
+ * (engine) then persists this set into `node_chunks` inside the
+ * same transaction as the node upsert, keeping the per-file reindex
+ * atomic.
+ */
+export function chunkDoc(doc: Pick<ParsedDoc, "body" | "bodyStartLine">): DocChunk[] {
+  const body = doc.body;
+  const bodyStartLine = doc.bodyStartLine;
+
+  // Fast path: empty body → single empty chunk so the node still has a
+  // retrieval row. Title-only nodes rely on this.
+  if (body.trim().length === 0) {
+    return [
+      {
+        chunkIdx: 0,
+        heading: null,
+        content: body,
+        contentHash: hashContentBytes(body),
+        startLine: bodyStartLine,
+        endLine: bodyStartLine,
+      },
+    ];
+  }
+
+  let sections = splitOnHeading(body, bodyStartLine, 2);
+
+  // No H2 at all → single whole-body chunk.
+  if (sections.length === 0) {
+    const bodyLines = body.split("\n");
+    return [
+      {
+        chunkIdx: 0,
+        heading: null,
+        content: body,
+        contentHash: hashContentBytes(body),
+        startLine: bodyStartLine,
+        endLine: bodyStartLine + bodyLines.length - 1,
+      },
+    ];
+  }
+
+  // Expand oversize sections via H3 sub-split.
+  const expanded: RawSection[] = [];
+  for (const s of sections) {
+    if (s.content.length <= MAX_CHUNK_CHARS) {
+      expanded.push(s);
+      continue;
+    }
+    // Try H3 sub-split by stripping the H2 heading line then re-splitting.
+    const firstNewline = s.content.indexOf("\n");
+    const bodyPart = firstNewline >= 0 ? s.content.slice(firstNewline + 1) : "";
+    const subs = splitOnHeading(bodyPart, s.startLine + 1, 3);
+    if (subs.length <= 1) {
+      // No sub-splits possible — keep oversize chunk as-is. Better a
+      // stable big chunk than an unstable retrieval key.
+      expanded.push(s);
+      continue;
+    }
+    // Prepend the H2 heading to the first H3 chunk so context survives.
+    const firstHeadingLine = s.content.slice(0, firstNewline);
+    const first = subs[0]!;
+    first.content = firstHeadingLine + "\n" + first.content;
+    first.startLine = s.startLine;
+    // Carry the parent H2 heading forward on chunks that lacked one
+    // (e.g. if H3 content exists before first H3 sub-heading).
+    for (const sub of subs) {
+      if (sub.heading === null) sub.heading = s.heading;
+    }
+    expanded.push(...subs);
+  }
+
+  // Merge too-small chunks into the previous chunk. "Previous" beats
+  // "next" because tail sections tend to be conclusions worth attaching
+  // to the body they summarize.
+  const merged: RawSection[] = [];
+  for (const s of expanded) {
+    if (merged.length > 0 && s.content.length < MIN_CHUNK_CHARS) {
+      const prev = merged[merged.length - 1]!;
+      prev.content = prev.content + (prev.content.endsWith("\n") ? "" : "\n") + s.content;
+      prev.endLine = s.endLine;
+      continue;
+    }
+    merged.push(s);
+  }
+
+  return merged.map((s, idx) => ({
+    chunkIdx: idx,
+    heading: s.heading,
+    content: s.content,
+    contentHash: hashContentBytes(s.content),
+    startLine: s.startLine,
+    endLine: s.endLine,
+  }));
+}
+
 export function serializeDoc(doc: ParsedDoc): string {
   const fmObj: Record<string, unknown> = { ...doc.frontmatter };
   // Ensure id/type are always present in serialized output (canonical form).
