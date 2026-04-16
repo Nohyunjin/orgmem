@@ -33,6 +33,10 @@ Commands:
   kg ask "<query>"          Grounded answer over the graph (vec search + 1-hop + LLM)
                               flags: --k N (default 5), --neighbor-cap N (default 6),
                                      --max-tokens N, --json
+  kg reindex [vault-path]   Wipe node_chunks + chunk_vec, rebuild from the vault.
+                              Run once after upgrading from v0.1 so every chunk is
+                              re-split by the current chunkDoc and marked pending
+                              for the next 'kg embed --resume'.
   kg mcp [--vault <path>]   Start the stdio MCP server (Claude Code / Cursor)
                               falls back to $ORGMEM_VAULT if --vault omitted
   kg extract-decisions <file>  Run Lane C Decision Extractor on a file inside the vault.
@@ -165,6 +169,81 @@ async function main(): Promise<void> {
         embedQueue,
       };
       process.stdout.write(JSON.stringify(out, null, 2) + "\n");
+    } finally {
+      handle.raw.close();
+    }
+    return;
+  }
+
+  if (cmd === "reindex") {
+    // Force-refresh the chunk retrieval layer. v0.2 users upgrading from
+    // v0.1 have a schema with node_chunks + chunk_vec but no rows (the
+    // migration only creates the tables); this command wipes them, then
+    // re-imports every file so chunkDoc populates fresh chunks marked
+    // 'pending' for the next `kg embed --resume`. Idempotent — safe to
+    // re-run at any time, though it invalidates cached embeddings.
+    const vault = rest[0] ?? process.env.ORGMEM_VAULT;
+    if (!vault) {
+      process.stderr.write(
+        "usage: kg reindex <vault-path>  (or set $ORGMEM_VAULT)\n",
+      );
+      process.exit(2);
+    }
+    const resolved = resolve(vault);
+    if (!existsSync(resolved)) {
+      process.stderr.write(`vault not found: ${resolved}\n`);
+      process.exit(2);
+    }
+    runMigrations();
+    const handle = openDb({ path: defaultDbPath(), loadVec: true });
+    try {
+      // Order matters — chunk_vec references chunk_ids; wipe the vec
+      // table first so the FK-less delete on node_chunks doesn't leave
+      // orphan vectors.
+      handle.raw.exec("BEGIN IMMEDIATE;");
+      let removedVecs = 0;
+      let removedChunks = 0;
+      try {
+        const v = handle.raw.prepare("DELETE FROM chunk_vec;").run();
+        removedVecs = typeof v.changes === "number" ? v.changes : 0;
+        const c = handle.raw.prepare("DELETE FROM node_chunks;").run();
+        removedChunks = typeof c.changes === "number" ? c.changes : 0;
+        handle.raw.exec("COMMIT;");
+      } catch (err) {
+        handle.raw.exec("ROLLBACK;");
+        throw err;
+      }
+
+      const importReport = importVault(handle, resolved);
+      const queue = handle.raw
+        .prepare(
+          "SELECT embedding_status AS s, COUNT(*) AS c FROM node_chunks GROUP BY embedding_status;",
+        )
+        .all() as Array<{ s: string; c: number }>;
+      const embedQueue: Record<string, number> = { pending: 0, embedded: 0, failed: 0 };
+      for (const r of queue) embedQueue[r.s] = r.c;
+      const totalChunks = (
+        handle.raw.prepare("SELECT COUNT(*) AS c FROM node_chunks;").get() as { c: number }
+      ).c;
+
+      process.stdout.write(
+        JSON.stringify(
+          {
+            vault: resolved,
+            removedChunks,
+            removedVecs,
+            import: importReport,
+            totalChunks,
+            embedQueue,
+            nextStep:
+              (embedQueue.pending ?? 0) > 0
+                ? "run `kg embed --resume` to fill chunk_vec"
+                : "chunks are up to date — no embedding needed",
+          },
+          null,
+          2,
+        ) + "\n",
+      );
     } finally {
       handle.raw.close();
     }
