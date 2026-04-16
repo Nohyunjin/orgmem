@@ -52,7 +52,11 @@ export interface AskResult {
   empty: boolean;
 }
 
-const DEFAULT_K = 5;
+// v0.2 default was k=5. Bumped to 10 in v0.2.1 so that chunks from short
+// docs (1-chunk SUMMARY.md etc.) still surface when they compete against
+// many chunks from larger docs — the v2-precision regression from the
+// 2026-04-16 dogfood (perf/dogfood-v0.2-20260416.md).
+const DEFAULT_K = 10;
 const DEFAULT_NEIGHBOR_CAP = 6;
 const DEFAULT_CONTENT_CHAR_CAP = 6000;
 
@@ -64,7 +68,9 @@ Rules:
 - Answer ONLY from the provided context. If the context does not contain the answer, say so explicitly — do not guess, do not fill in from prior knowledge.
 - Cite every factual claim with the chunk's citation exactly as provided, in double brackets. Example: [[doc-payment-spec#Goals]].
 - Do not invent node ids, headings, or edges that are not in the context.
-- Prefer concise answers. Use bullet points when listing multiple items.`;
+- Prefer concise answers. Use bullet points when listing multiple items.
+- Literal existence check. When the query asks whether a specific named artifact exists (e.g. a template, checklist, spec, schema, runbook), answer "yes, it exists" ONLY if the context explicitly introduces or defines that artifact by name. If the context merely contains adjacent content that could be adapted into the artifact (e.g. the user asks for an "interview template" and the context has 3 example questions under a non-template heading), report: "No <artifact> was found in the graph. Related content appears in [[…]]." Do NOT stretch adjacent content into a claim that the named artifact exists.
+- A chunk's heading states the scope of its body. Do not infer a chunk's topic from body keywords alone — if a heading does not directly concern the query topic, treat the chunk as supporting context at best, not as primary evidence that the topic is present in the graph.`;
 
 const EMPTY_ANSWER =
   "No relevant chunks found in the graph for this query. " +
