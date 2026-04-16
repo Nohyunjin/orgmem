@@ -129,8 +129,13 @@ async function main(): Promise<void> {
     for (const q of QUERIES) {
       process.stderr.write(`\n[dogfood] ${q.id}: ${q.query}\n`);
       const t0 = performance.now();
+      // Let ask.ts apply its own DEFAULT_K. Hardcoding k here in a prior
+      // iteration shadowed the v0.2.1 bump from 5→10 and masked the
+      // v2-precision fix during the first re-measure (see
+      // perf/dogfood-v0.2.1-20260416.md). Only neighborCap stays
+      // explicit — we want consistent edge expansion regardless of
+      // future default changes.
       const res = await ask(handle, embedClient, answerClient, q.query, {
-        k: 5,
         neighborCap: 6,
       });
       const elapsed = performance.now() - t0;
